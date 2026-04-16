@@ -12,10 +12,10 @@ def load_config(config_file: str = "config.json") -> Dict:
         with open(config_file, "r", encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
-        print(f"Config file not found: {config_file}")
+        print(f"[✓] - Config file not found: {config_file}")
         return {}
     except json.JSONDecodeError:
-        print(f"Invalid JSON in config file: {config_file}")
+        print(f"[✗] - Invalid JSON in config file: {config_file}")
         return {}
 
 # Load configuration
@@ -47,7 +47,7 @@ def load_proxies(api_url: str) -> List[str]:
     proxy_urls: List[str] = []
 
     try:
-        print("Fetching proxies from API...")
+        print("[✓] - Fetching proxies from API...")
         response = requests.get(api_url, timeout=10)
         response.raise_for_status()
         
@@ -62,9 +62,9 @@ def load_proxies(api_url: str) -> List[str]:
 
             proxy_urls.append(proxy_url)
         
-        print(f"Loaded {len(proxy_urls)} proxies from API")
+        print(f"[✓] - Loaded {len(proxy_urls)} proxies from API")
     except requests.exceptions.RequestException as e:
-        print(f"Failed to fetch proxies from API: {e}")
+        print(f"[✗] - Failed to fetch proxies from API: {e}")
 
     return proxy_urls
 
@@ -115,9 +115,9 @@ def remove_proxy(proxy_url: str, reason: str = "failure") -> None:
             proxy_count = len(proxies)
             if show_proxy_logs:
                 if reason == "timeout":
-                    print(f"❌ Removed slow proxy (>{max_proxy_response_time}s): {proxy_url} (remaining {proxy_count})")
+                    print(f"[X] - Removed slow proxy (>{max_proxy_response_time}s): {proxy_url} (remaining {proxy_count})")
                 else:
-                    print(f"❌ Removed failing proxy: {proxy_url} (remaining {proxy_count})")
+                    print(f"[X] - Removed failing proxy: {proxy_url} (remaining {proxy_count})")
         # Clean up tracking data
         if proxy_url in proxy_response_times:
             del proxy_response_times[proxy_url]
@@ -145,7 +145,7 @@ def is_ignorable_proxy_error(exc: Exception) -> bool:
 def appendToFile(username: str) -> None:
     with open(result_file, "a", encoding="utf-8") as f:
         f.write(username + "\n")
-    print(f"Appended {username} to {result_file}")
+    print(f"[✓] - Appended {username} to {result_file}")
 
 
 def pickRandomUsername() -> str:
@@ -168,7 +168,7 @@ def checkUsername(username: str) -> bool:
             proxy_url = get_random_proxy()
 
         if proxy_url is None:
-            print("No proxies available for checking username.")
+            print("[X] - No proxies available for checking username.")
             return False
 
         proxy = format_proxy(proxy_url) if proxy_url else None
@@ -185,22 +185,22 @@ def checkUsername(username: str) -> bool:
             # Remove proxy if response time exceeds threshold
             if response_time > max_proxy_response_time:
                 if show_proxy_logs:
-                    print(f"⏱️  Slow proxy detected ({response_time:.2f}s > {max_proxy_response_time}s): {proxy_url}")
+                    print(f"[X] - Slow proxy detected ({response_time:.2f}s > {max_proxy_response_time}s): {proxy_url}")
                 remove_proxy(proxy_url, reason="timeout")
                 continue  # retry with another proxy
                 
         except requests.exceptions.Timeout:
             if show_proxy_logs:
-                print(f"⏱️  Timeout via proxy {proxy_url} - removing slow proxy")
+                print(f"[X] - Timeout via proxy {proxy_url} - removing slow proxy")
             remove_proxy(proxy_url, reason="timeout")
             continue  # retry with another proxy
         except requests.exceptions.SSLError as ssl_exc:
             if show_proxy_logs and not is_ignorable_proxy_error(ssl_exc):
-                print(f"SSL error via proxy {proxy_url}: {ssl_exc}")
+                print(f"[X] - SSL error via proxy {proxy_url}: {ssl_exc}")
             continue  # retry with another proxy
         except requests.exceptions.RequestException as exc:
             if show_proxy_logs and not is_ignorable_proxy_error(exc):
-                print(f"Request error via proxy {proxy_url}: {exc}")
+                print(f"[X] - Request error via proxy {proxy_url}: {exc}")
             continue  # retry with another proxy
 
         if response.status_code == 200:
@@ -209,18 +209,18 @@ def checkUsername(username: str) -> bool:
                 valid = not taken
             except ValueError:
                 if show_proxy_logs:
-                    print("Invalid JSON response")
+                    print(f"[X] - Invalid JSON response")
                 continue  # retry
             if valid:
-                print(f"✅ VALID USERNAME FOUND: {username}")
+                print(f"[BINGOOO] - VALID USERNAME FOUND: {username}")
             elif show_proxy_logs:
-                print(f"✓ {username} -> taken={taken} ({response_time:.2f}s) via {proxy_url}")
+                print(f"[✓] - {username} -> taken={taken} ({response_time:.2f}s) via {proxy_url}")
             time.sleep(rate_limit_seconds)  # Add delay after successful request
             return valid
 
         if response.status_code == 429:
             if show_proxy_logs:
-                print(f"⚠️  Rate limited (429) via {proxy_url}; switching proxy.")
+                print(f"[X] - Rate limited (429) via {proxy_url}; switching proxy.")
             with proxy_lock:
                 proxy_failures[proxy_url] = proxy_failures.get(proxy_url, 0) + 1
                 if proxy_failures[proxy_url] >= proxy_fail_limit:
@@ -229,15 +229,15 @@ def checkUsername(username: str) -> bool:
             thread_local.proxy = get_random_proxy()
             if thread_local.proxy is None:
                 if show_proxy_logs:
-                    print(f"No proxies available after rate limit on {proxy_url}")
+                    print(f"[X] - No proxies available after rate limit on {proxy_url}")
                 return False
             if show_proxy_logs:
-                print(f"Switched to proxy: {thread_local.proxy}")
+                print(f"[✓] - Switched to proxy: {thread_local.proxy}")
             time.sleep(rate_limit_backoff)  # Wait longer after rate limit
             return False  # don't retry username, just switch proxy
 
         if show_proxy_logs:
-            print(f"Error: {response.status_code} - {response.text} via {proxy_url}")
+            print(f"[X] - Error: {response.status_code} - {response.text} via {proxy_url}")
         time.sleep(rate_limit_seconds)  # Add delay after other errors
         continue  # retry with another proxy
 
@@ -249,21 +249,21 @@ def worker():
     thread_name = threading.current_thread().name
     thread_local.proxy = get_random_proxy()
     if thread_local.proxy is None:
-        print(f"{thread_name}: No proxies available, stopping.")
+        print(f"[X] - {thread_name}: No proxies available, stopping.")
         return
     if show_proxy_logs:
-        print(f"{thread_name} started with proxy: {thread_local.proxy}")
+        print(f"[✓] - {thread_name} started with proxy: {thread_local.proxy}")
     while True:
         # Check if proxy is still available before making request
         if thread_local.proxy is None:
             thread_local.proxy = get_random_proxy()
             if thread_local.proxy is None:
-                print(f"{thread_name}: No proxies available, stopping.")
+                print(f"[X] - {thread_name}: No proxies available, stopping.")
                 break
         
         username = pickRandomUsername()
         if checkUsername(username):
-            print(f"Valid username found: {username}")
+            print(f"[BINGOOO] - Valid username found: {username}")
             appendToFile(username)
 
 

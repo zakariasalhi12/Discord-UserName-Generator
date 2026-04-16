@@ -3,9 +3,9 @@
   "username_length": 4,
   "rate_limit_seconds": 0,
   "rate_limit_backoff": 5,
-  "max_proxy_response_time": 9,
+  "max_proxy_response_time": 10,
   "proxy_fail_limit": 2,
   "threads_number": 3,
-  "show_proxy_logs": false,
+  "show_proxy_logs": true,
   "result_file": "result.txt"
 }
