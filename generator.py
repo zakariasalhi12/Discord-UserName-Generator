@@ -1,4 +1,3 @@
-# import requests
 import random
 import requests
 import time
@@ -11,6 +10,7 @@ username_length = 3
 rate_limit_seconds = 1.0
 proxy_file = "proxies.txt"
 proxy_fail_limit = 2
+threads_number = 3
 
 characters = [
     'a','b','c','d','e','f','g','h','i','j','k','l','m',
@@ -23,7 +23,6 @@ characters = [
 characters_len = len(characters)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 
 def load_proxies(file_path: str) -> List[str]:
     proxy_urls: List[str] = []
@@ -54,6 +53,8 @@ proxies = load_proxies(proxy_file)
 proxy_count = len(proxies)
 proxy_lock = threading.Lock()
 proxy_failures: Dict[str, int] = {}
+proxy_index = 0
+thread_local = threading.local()
 
 session = requests.Session()
 session.trust_env = False
@@ -68,6 +69,16 @@ def get_random_proxy() -> Optional[str]:
         if proxy_count == 0:
             return None
         return random.choice(proxies)
+
+
+def get_next_proxy() -> Optional[str]:
+    global proxy_index
+    with proxy_lock:
+        if proxy_count == 0:
+            return None
+        proxy = proxies[proxy_index % proxy_count]
+        proxy_index += 1
+        return proxy
 
 
 def remove_proxy(proxy_url: str) -> None:
@@ -116,76 +127,71 @@ def pickRandomUsername() -> str:
 
 def checkUsername(username: str) -> bool:
     payload = {"username": username}
-    proxy_url = get_random_proxy()
-    proxy = format_proxy(proxy_url) if proxy_url else None
+    max_retries = 3
 
-    try:
-        response = session.post(endpoint, json=payload, proxies=proxy, timeout=15)
-    except requests.exceptions.SSLError as ssl_exc:
-        if proxy_url:
-            with proxy_lock:
-                proxy_failures[proxy_url] = proxy_failures.get(proxy_url, 0) + 1
-                if proxy_failures[proxy_url] >= proxy_fail_limit:
-                    remove_proxy(proxy_url)
-        if not is_ignorable_proxy_error(ssl_exc):
-            print(f"SSL error via proxy {proxy_url}: {ssl_exc}")
-        return False
-    except requests.exceptions.RequestException as exc:
-        if proxy_url:
-            with proxy_lock:
-                proxy_failures[proxy_url] = proxy_failures.get(proxy_url, 0) + 1
-                if proxy_failures[proxy_url] >= proxy_fail_limit:
-                    remove_proxy(proxy_url)
-        if not is_ignorable_proxy_error(exc):
-            print(f"Request error via proxy {proxy_url}: {exc}")
-        return False
+    for attempt in range(max_retries):
+        if attempt == 0:
+            proxy_url = getattr(thread_local, 'proxy', None)
+        else:
+            proxy_url = get_random_proxy()
 
-    if response.status_code == 200:
-        try:
-            taken = response.json().get("taken", False)
-            valid = not taken
-        except ValueError:
-            print("Invalid JSON response")
+        if proxy_url is None:
             return False
-        print(f"{username} -> taken={taken} via {proxy_url}")
-        return valid
 
-    if response.status_code == 429:
-        print(f"Rate limited (429) via {proxy_url}; rotating proxy and sleeping.")
-        if proxy_url:
+        proxy = format_proxy(proxy_url) if proxy_url else None
+
+        try:
+            response = session.post(endpoint, json=payload, proxies=proxy, timeout=15)
+        except requests.exceptions.SSLError as ssl_exc:
+            if not is_ignorable_proxy_error(ssl_exc):
+                print(f"SSL error via proxy {proxy_url}: {ssl_exc}")
+            continue  # retry with another proxy
+        except requests.exceptions.RequestException as exc:
+            if not is_ignorable_proxy_error(exc):
+                print(f"Request error via proxy {proxy_url}: {exc}")
+            continue  # retry with another proxy
+
+        if response.status_code == 200:
+            try:
+                taken = response.json().get("taken", False)
+                valid = not taken
+            except ValueError:
+                print("Invalid JSON response")
+                continue  # retry
+            print(f"{username} -> taken={taken} via {proxy_url}")
+            return valid
+
+        if response.status_code == 429:
+            print(f"Rate limited (429) via {proxy_url}; switching proxy.")
             with proxy_lock:
                 proxy_failures[proxy_url] = proxy_failures.get(proxy_url, 0) + 1
                 if proxy_failures[proxy_url] >= proxy_fail_limit:
                     remove_proxy(proxy_url)
-        time.sleep(rate_limit_seconds * 2)
-        return False
+            # switch proxy for this thread
+            thread_local.proxy = get_next_proxy()
+            return False  # don't retry username, just switch proxy
 
-    print(f"Error: {response.status_code} - {response.text} via {proxy_url}")
-    if proxy_url:
-        with proxy_lock:
-            proxy_failures[proxy_url] = proxy_failures.get(proxy_url, 0) + 1
-            if proxy_failures[proxy_url] >= proxy_fail_limit:
-                remove_proxy(proxy_url)
+        print(f"Error: {response.status_code} - {response.text} via {proxy_url}")
+        continue  # retry with another proxy
+
+    # if all attempts failed, return False
     return False
 
 
 def worker():
     thread_name = threading.current_thread().name
-    print(f"{thread_name} started")
+    thread_local.proxy = get_next_proxy()
+    print(f"{thread_name} started with proxy: {thread_local.proxy}")
     while True:
         username = pickRandomUsername()
-        print(f"{thread_name} checking {username}")
-
         if checkUsername(username):
             print(f"Valid username found: {username}")
             appendToFile(username)
 
-        time.sleep(rate_limit_seconds)
-
 
 if __name__ == "__main__":
     threads = []
-    for i in range(3):
+    for i in range(threads_number):
         t = threading.Thread(target=worker, name=f"Worker-{i+1}")
         t.daemon = True
         threads.append(t)
