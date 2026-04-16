@@ -136,6 +136,7 @@ def checkUsername(username: str) -> bool:
             proxy_url = get_random_proxy()
 
         if proxy_url is None:
+            print("No proxies available for checking username.")
             return False
 
         proxy = format_proxy(proxy_url) if proxy_url else None
@@ -159,6 +160,7 @@ def checkUsername(username: str) -> bool:
                 print("Invalid JSON response")
                 continue  # retry
             print(f"{username} -> taken={taken} via {proxy_url}")
+            time.sleep(rate_limit_seconds)  # Add delay after successful request
             return valid
 
         if response.status_code == 429:
@@ -168,10 +170,12 @@ def checkUsername(username: str) -> bool:
                 if proxy_failures[proxy_url] >= proxy_fail_limit:
                     remove_proxy(proxy_url)
             # switch proxy for this thread
-            thread_local.proxy = get_next_proxy()
+            thread_local.proxy = get_random_proxy()
+            time.sleep(rate_limit_seconds)  # Add delay after rate limit
             return False  # don't retry username, just switch proxy
 
         print(f"Error: {response.status_code} - {response.text} via {proxy_url}")
+        time.sleep(rate_limit_seconds)  # Add delay after other errors
         continue  # retry with another proxy
 
     # if all attempts failed, return False
@@ -180,13 +184,20 @@ def checkUsername(username: str) -> bool:
 
 def worker():
     thread_name = threading.current_thread().name
-    thread_local.proxy = get_next_proxy()
+    thread_local.proxy = get_random_proxy()
+    if thread_local.proxy is None:
+        print(f"{thread_name}: No proxies available, stopping.")
+        return
     print(f"{thread_name} started with proxy: {thread_local.proxy}")
     while True:
         username = pickRandomUsername()
         if checkUsername(username):
             print(f"Valid username found: {username}")
             appendToFile(username)
+        # Check if proxy is still available
+        if thread_local.proxy is None:
+            print(f"{thread_name}: Proxy exhausted, stopping.")
+            break
 
 
 if __name__ == "__main__":
