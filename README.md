@@ -12,13 +12,20 @@ This script generates random Discord usernames and checks their availability usi
 
 ## Setup
 
-1. Download a list of proxies from [ProxyScrape](https://proxyscrape.com/free-proxy-list).
-2. Save the proxy list as `proxies.txt` in the same directory as `generator.py`. Each proxy should be on a new line, e.g.:
+1. Install Python dependencies:
+   ```bash
+   pip install requests
    ```
-   http://proxy1:port
-   socks4://proxy2:port
-   ```
-3. Ensure `proxies.txt` is present.
+2. The script automatically fetches proxies from the [ProxyScrape API](https://api.proxyscrape.com/), so no manual proxy setup is required.
+
+## Configuration
+
+Edit `generator.py` to customize the script behavior:
+
+- `threads_number` - Number of worker threads (default: 3)
+- `username_length` - Length of generated usernames (default: 3)
+- `max_proxy_response_time` - Max response time in seconds before removing a proxy (default: 9)
+- `show_proxy_logs` - Set to `True` to see detailed proxy logs, `False` to only see found usernames (default: False)
 
 ## Running the Script
 
@@ -32,8 +39,9 @@ The script will start 3 threads, each checking random usernames using random pro
 
 ## Output
 
-- Console output shows thread activity and check results.
-- Valid usernames are appended to `result.txt`.
+- **Always visible**: Valid usernames are printed and saved to `result.txt` (e.g., `✅ VALID USERNAME FOUND: abc`)
+- **With `show_proxy_logs = True`**: Detailed proxy information including response times, errors, rate limits, and slow proxy removals
+- **With `show_proxy_logs = False`** (default): Only valid usernames are displayed for a clean output
 
 ## Notes
 
