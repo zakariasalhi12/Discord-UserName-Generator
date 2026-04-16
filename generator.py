@@ -76,7 +76,7 @@ def format_proxy(proxy_url: str) -> Dict[str, str]:
 
 proxies = load_proxies(proxy_api_url)
 proxy_count = len(proxies)
-proxy_lock = threading.Lock()
+proxy_lock = threading.RLock()
 proxy_failures: Dict[str, int] = {}
 proxy_response_times: Dict[str, float] = {}  # Track response times per proxy
 proxy_index = 0
@@ -244,10 +244,13 @@ def checkUsername(username: str) -> bool:
         if response.status_code == 429:
             if show_proxy_logs:
                 print(f"[X] - Rate limited (429) via {proxy_url}; switching proxy.")
+            remove_proxy_now = False
             with proxy_lock:
                 proxy_failures[proxy_url] = proxy_failures.get(proxy_url, 0) + 1
                 if proxy_failures[proxy_url] >= proxy_fail_limit:
-                    remove_proxy(proxy_url)
+                    remove_proxy_now = True
+            if remove_proxy_now:
+                remove_proxy(proxy_url)
             # switch proxy for this thread
             thread_local.proxy = get_random_proxy()
             if thread_local.proxy is None:
