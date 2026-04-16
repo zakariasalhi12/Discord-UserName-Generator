@@ -20,12 +20,34 @@ This script generates random Discord usernames and checks their availability usi
 
 ## Configuration
 
-Edit `generator.py` to customize the script behavior:
+All settings are stored in `config.json`. Edit this file to customize the script behavior:
 
-- `threads_number` - Number of worker threads (default: 3)
-- `username_length` - Length of generated usernames (default: 3)
-- `max_proxy_response_time` - Max response time in seconds before removing a proxy (default: 9)
-- `show_proxy_logs` - Set to `True` to see detailed proxy logs, `False` to only see found usernames (default: False)
+```json
+{
+  "endpoint": "https://discord.com/api/v9/unique-username/username-attempt-unauthed",
+  "proxy_api_url": "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=619",
+  "username_length": 4,
+  "rate_limit_seconds": 0,
+  "rate_limit_backoff": 5,
+  "max_proxy_response_time": 9,
+  "proxy_fail_limit": 2,
+  "threads_number": 3,
+  "show_proxy_logs": false,
+  "result_file": "result.txt"
+}
+```
+
+**Configuration Options:**
+- `endpoint` - Discord API endpoint URL
+- `proxy_api_url` - ProxyScrape API URL for fetching proxies
+- `username_length` - Length of generated usernames
+- `rate_limit_seconds` - Delay between normal requests (0 = no delay)
+- `rate_limit_backoff` - Delay after 429 rate limit response
+- `max_proxy_response_time` - Maximum proxy response time in seconds
+- `proxy_fail_limit` - Number of failures before removing a proxy
+- `threads_number` - Number of worker threads
+- `show_proxy_logs` - Set to `true` for detailed proxy logs, `false` for clean output
+- `result_file` - Output file for valid usernames
 
 ## Running the Script
 

@@ -3,17 +3,33 @@ import requests
 import time
 import threading
 import urllib3
+import json
 from typing import Dict, List, Optional
 
-endpoint = "https://discord.com/api/v9/unique-username/username-attempt-unauthed"
-proxy_api_url = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=619"
-username_length = 3
-rate_limit_seconds = 0
-rate_limit_backoff = 5  # Delay when getting 429
-max_proxy_response_time = 9  # Max response time in seconds
-proxy_fail_limit = 2
-threads_number = 3
-show_proxy_logs = False  # Set to True to see proxy logs, False to only see usernames
+def load_config(config_file: str = "config.json") -> Dict:
+    """Load configuration from JSON file"""
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"Config file not found: {config_file}")
+        return {}
+    except json.JSONDecodeError:
+        print(f"Invalid JSON in config file: {config_file}")
+        return {}
+
+# Load configuration
+config = load_config()
+endpoint = config.get("endpoint", "https://discord.com/api/v9/unique-username/username-attempt-unauthed")
+proxy_api_url = config.get("proxy_api_url", "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=619")
+username_length = config.get("username_length", 4)
+rate_limit_seconds = config.get("rate_limit_seconds", 0)
+rate_limit_backoff = config.get("rate_limit_backoff", 5)
+max_proxy_response_time = config.get("max_proxy_response_time", 9)
+proxy_fail_limit = config.get("proxy_fail_limit", 2)
+threads_number = config.get("threads_number", 3)
+show_proxy_logs = config.get("show_proxy_logs", False)
+result_file = config.get("result_file", "result.txt")
 
 characters = [
     'a','b','c','d','e','f','g','h','i','j','k','l','m',
@@ -127,9 +143,9 @@ def is_ignorable_proxy_error(exc: Exception) -> bool:
 
 
 def appendToFile(username: str) -> None:
-    with open("result.txt", "a", encoding="utf-8") as f:
+    with open(result_file, "a", encoding="utf-8") as f:
         f.write(username + "\n")
-    print(f"Appended {username} to result.txt")
+    print(f"Appended {username} to {result_file}")
 
 
 def pickRandomUsername() -> str:
