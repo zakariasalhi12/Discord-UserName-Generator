@@ -1,11 +1,12 @@
 {
+  "discord_webhook_url": "your_discord_webhook_url_here",
   "proxy_api_url": "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=619",
-  "username_length": 4,
+  "username_length": 3,
   "rate_limit_seconds": 0,
   "rate_limit_backoff": 5,
   "max_proxy_response_time": 10,
   "proxy_fail_limit": 2,
-  "threads_number": 3,
+  "threads_number": 10,
   "show_proxy_logs": true,
   "result_file": "result.txt"
 }

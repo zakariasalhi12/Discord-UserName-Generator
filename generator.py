@@ -30,6 +30,7 @@ proxy_fail_limit = config.get("proxy_fail_limit", 2)
 threads_number = config.get("threads_number", 3)
 show_proxy_logs = config.get("show_proxy_logs", False)
 result_file = config.get("result_file", "result.txt")
+discord_webhook_url = config.get("discord_webhook_url", "").strip()
 
 characters = [
     'a','b','c','d','e','f','g','h','i','j','k','l','m',
@@ -146,6 +147,22 @@ def appendToFile(username: str) -> None:
     with open(result_file, "a", encoding="utf-8") as f:
         f.write(username + "\n")
     print(f"[✓] - Appended {username} to {result_file}")
+
+
+def send_discord_webhook(username: str) -> None:
+    if not discord_webhook_url:
+        return
+
+    payload = {"content": f"[+] username found: {username}"}
+    try:
+        response = session.post(discord_webhook_url, json=payload, timeout=10)
+        if response.status_code in (200, 204):
+            if show_proxy_logs:
+                print(f"[✓] - Sent webhook notification for {username}")
+        else:
+            print(f"[X] - Webhook send failed ({response.status_code}): {response.text}")
+    except requests.exceptions.RequestException as exc:
+        print(f"[X] - Discord webhook request failed: {exc}")
 
 
 def pickRandomUsername() -> str:
@@ -265,6 +282,7 @@ def worker():
         if checkUsername(username):
             print(f"[BINGOOO] - Valid username found: {username}")
             appendToFile(username)
+            send_discord_webhook(username)
 
 
 if __name__ == "__main__":

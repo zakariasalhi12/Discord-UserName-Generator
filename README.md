@@ -33,7 +33,8 @@ All settings are stored in `config.json`. Edit this file to customize the script
   "proxy_fail_limit": 2,
   "threads_number": 3,
   "show_proxy_logs": false,
-  "result_file": "result.txt"
+  "result_file": "result.txt",
+  "discord_webhook_url": ""
 }
 ```
 
