@@ -1,6 +1,9 @@
 # Discord Username Generator
 
+
 This script generates random Discord usernames and checks their availability using the Discord API. It uses a list of proxies to avoid rate limiting.
+
+![Discord Username Generator](assets/image.png)
 
 ## Requirements
 
