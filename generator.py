@@ -10,7 +10,7 @@ username_length = 3
 rate_limit_seconds = 1.0
 proxy_file = "proxies.txt"
 proxy_fail_limit = 2
-threads_number = 3
+threads_number = 5
 
 characters = [
     'a','b','c','d','e','f','g','h','i','j','k','l','m',
