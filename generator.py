@@ -92,7 +92,7 @@ session.headers.update({
 
 def get_random_proxy() -> Optional[str]:
     with proxy_lock:
-        if proxy_count == 0:
+        if proxy_count == 0 or not proxies:
             return None
         return random.choice(proxies)
 
@@ -100,7 +100,7 @@ def get_random_proxy() -> Optional[str]:
 def get_next_proxy() -> Optional[str]:
     global proxy_index
     with proxy_lock:
-        if proxy_count == 0:
+        if proxy_count == 0 or not proxies:
             return None
         proxy = proxies[proxy_index % proxy_count]
         proxy_index += 1
@@ -114,6 +114,8 @@ def remove_proxy(proxy_url: str, reason: str = "failure") -> None:
         if proxy_url in proxies:
             proxies.remove(proxy_url)
             proxy_count = len(proxies)
+            if thread_local is not None and getattr(thread_local, 'proxy', None) == proxy_url:
+                thread_local.proxy = None
             if show_proxy_logs:
                 if reason == "timeout":
                     print(f"[X] - Removed slow proxy (>{max_proxy_response_time}s): {proxy_url} (remaining {proxy_count})")
@@ -181,6 +183,10 @@ def checkUsername(username: str) -> bool:
     for attempt in range(max_retries):
         if attempt == 0:
             proxy_url = getattr(thread_local, 'proxy', None)
+            with proxy_lock:
+                if proxy_url and proxy_url not in proxies:
+                    proxy_url = get_random_proxy()
+                    thread_local.proxy = proxy_url
         else:
             proxy_url = get_random_proxy()
 
@@ -188,7 +194,7 @@ def checkUsername(username: str) -> bool:
             print("[X] - No proxies available for checking username.")
             return False
 
-        proxy = format_proxy(proxy_url) if proxy_url else None
+        proxy = format_proxy(proxy_url)
 
         try:
             start_time = time.time()
@@ -271,13 +277,17 @@ def worker():
     if show_proxy_logs:
         print(f"[✓] - {thread_name} started with proxy: {thread_local.proxy}")
     while True:
-        # Check if proxy is still available before making request
-        if thread_local.proxy is None:
+        with proxy_lock:
+            if not proxies:
+                print(f"[X] - {thread_name}: No proxies remaining, stopping.")
+                break
+
+        if thread_local.proxy is None or thread_local.proxy not in proxies:
             thread_local.proxy = get_random_proxy()
             if thread_local.proxy is None:
                 print(f"[X] - {thread_name}: No proxies available, stopping.")
                 break
-        
+
         username = pickRandomUsername()
         if checkUsername(username):
             print(f"[BINGOOO] - Valid username found: {username}")
