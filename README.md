@@ -32,6 +32,11 @@ All settings are stored in `config.json`. Edit this file to customize the script
   "max_proxy_response_time": 9,
   "proxy_fail_limit": 2,
   "threads_number": 3,
+  "proxy_refresh_interval_seconds": 60,
+  "thread_restart_interval_seconds": 60,
+  "proxy_empty_retry_seconds": 5,
+  "request_timeout_seconds": 10,
+  "status_interval_seconds": 10,
   "show_proxy_logs": false,
   "result_file": "result.txt",
   "discord_webhook_url": ""
@@ -47,6 +52,11 @@ All settings are stored in `config.json`. Edit this file to customize the script
 - `max_proxy_response_time` - Maximum proxy response time in seconds
 - `proxy_fail_limit` - Number of failures before removing a proxy
 - `threads_number` - Number of worker threads
+- `proxy_refresh_interval_seconds` - Minimum seconds between automatic proxy refreshes
+- `thread_restart_interval_seconds` - Seconds before stopping workers, refetching proxies, and starting a fresh worker batch (`0` disables scheduled restarts)
+- `proxy_empty_retry_seconds` - Seconds to wait before retrying proxy fetches when the list is empty
+- `request_timeout_seconds` - Maximum seconds to wait for each Discord check request
+- `status_interval_seconds` - Seconds between progress status lines
 - `show_proxy_logs` - Set to `true` for detailed proxy logs, `false` for clean output
 - `result_file` - Output file for valid usernames
 

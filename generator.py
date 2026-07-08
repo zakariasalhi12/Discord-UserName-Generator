@@ -28,6 +28,11 @@ rate_limit_backoff = config.get("rate_limit_backoff", 5)
 max_proxy_response_time = config.get("max_proxy_response_time", 9)
 proxy_fail_limit = config.get("proxy_fail_limit", 2)
 threads_number = config.get("threads_number", 3)
+proxy_refresh_interval_seconds = config.get("proxy_refresh_interval_seconds", 60)
+thread_restart_interval_seconds = config.get("thread_restart_interval_seconds", 60)
+proxy_empty_retry_seconds = config.get("proxy_empty_retry_seconds", 5)
+request_timeout_seconds = config.get("request_timeout_seconds", 10)
+status_interval_seconds = config.get("status_interval_seconds", 10)
 show_proxy_logs = config.get("show_proxy_logs", False)
 result_file = config.get("result_file", "result.txt")
 discord_webhook_url = config.get("discord_webhook_url", "").strip()
@@ -74,13 +79,22 @@ def format_proxy(proxy_url: str) -> Dict[str, str]:
     return {"http": proxy_url, "https": proxy_url}
 
 
-proxies = load_proxies(proxy_api_url)
-proxy_count = len(proxies)
+proxies: List[str] = []
+proxy_count = 0
 proxy_lock = threading.RLock()
+proxy_refresh_lock = threading.Lock()
 proxy_failures: Dict[str, int] = {}
 proxy_response_times: Dict[str, float] = {}  # Track response times per proxy
 proxy_index = 0
+last_proxy_refresh = 0.0
 thread_local = threading.local()
+stats_lock = threading.Lock()
+stats = {
+    "started": 0,
+    "completed": 0,
+    "failed": 0,
+    "valid": 0,
+}
 
 session = requests.Session()
 session.trust_env = False
@@ -88,6 +102,53 @@ session.verify = False
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 })
+
+
+def replace_proxies(proxy_urls: List[str]) -> None:
+    global proxies, proxy_count, proxy_index
+
+    unique_proxy_urls = list(dict.fromkeys(proxy_urls))
+    with proxy_lock:
+        proxies = unique_proxy_urls
+        proxy_count = len(proxies)
+        proxy_index = 0
+        proxy_failures.clear()
+        proxy_response_times.clear()
+
+
+def refresh_proxies(force: bool = False) -> bool:
+    global last_proxy_refresh
+
+    now = time.time()
+    if not force and proxy_refresh_interval_seconds > 0:
+        with proxy_lock:
+            elapsed_since_refresh = now - last_proxy_refresh
+            if proxies and elapsed_since_refresh < proxy_refresh_interval_seconds:
+                return True
+            if not proxies and elapsed_since_refresh < proxy_empty_retry_seconds:
+                return False
+
+    with proxy_refresh_lock:
+        now = time.time()
+        if not force and proxy_refresh_interval_seconds > 0:
+            with proxy_lock:
+                elapsed_since_refresh = now - last_proxy_refresh
+                if proxies and elapsed_since_refresh < proxy_refresh_interval_seconds:
+                    return True
+                if not proxies and elapsed_since_refresh < proxy_empty_retry_seconds:
+                    return False
+
+        proxy_urls = load_proxies(proxy_api_url)
+        last_proxy_refresh = time.time()
+        if not proxy_urls:
+            with proxy_lock:
+                has_existing_proxies = bool(proxies)
+            if has_existing_proxies:
+                print("[X] - Proxy refresh failed; keeping existing proxy list.")
+            return has_existing_proxies
+
+        replace_proxies(proxy_urls)
+        return True
 
 
 def get_random_proxy() -> Optional[str]:
@@ -124,6 +185,29 @@ def remove_proxy(proxy_url: str, reason: str = "failure") -> None:
         # Clean up tracking data
         if proxy_url in proxy_response_times:
             del proxy_response_times[proxy_url]
+
+
+def increment_stat(name: str, amount: int = 1) -> None:
+    with stats_lock:
+        stats[name] = stats.get(name, 0) + amount
+
+
+def snapshot_stats() -> Dict[str, int]:
+    with stats_lock:
+        return dict(stats)
+
+
+def log_status(cycle: int) -> None:
+    with proxy_lock:
+        remaining_proxies = proxy_count
+    current_stats = snapshot_stats()
+    print(
+        f"[✓] - Cycle {cycle} status: "
+        f"checked={current_stats['completed']} "
+        f"failed={current_stats['failed']} "
+        f"valid={current_stats['valid']} "
+        f"proxies={remaining_proxies}"
+    )
 
 
 def is_ignorable_proxy_error(exc: Exception) -> bool:
@@ -176,15 +260,18 @@ def pickRandomUsername() -> str:
     return username
 
 
-def checkUsername(username: str) -> bool:
+def checkUsername(username: str, stop_event: Optional[threading.Event] = None) -> bool:
     payload = {"username": username}
     max_retries = 3
 
     for attempt in range(max_retries):
+        if stop_event is not None and stop_event.is_set():
+            return False
+
         if attempt == 0:
             proxy_url = getattr(thread_local, 'proxy', None)
             with proxy_lock:
-                if proxy_url and proxy_url not in proxies:
+                if not proxy_url or proxy_url not in proxies:
                     proxy_url = get_random_proxy()
                     thread_local.proxy = proxy_url
         else:
@@ -192,13 +279,15 @@ def checkUsername(username: str) -> bool:
 
         if proxy_url is None:
             print("[X] - No proxies available for checking username.")
+            refresh_proxies()
             return False
 
         proxy = format_proxy(proxy_url)
+        increment_stat("started")
 
         try:
             start_time = time.time()
-            response = session.post(endpoint, json=payload, proxies=proxy, timeout=15)
+            response = session.post(endpoint, json=payload, proxies=proxy, timeout=request_timeout_seconds)
             response_time = time.time() - start_time
             
             # Track and check response time
@@ -216,14 +305,19 @@ def checkUsername(username: str) -> bool:
             if show_proxy_logs:
                 print(f"[X] - Timeout via proxy {proxy_url} - removing slow proxy")
             remove_proxy(proxy_url, reason="timeout")
+            increment_stat("failed")
             continue  # retry with another proxy
         except requests.exceptions.SSLError as ssl_exc:
             if show_proxy_logs and not is_ignorable_proxy_error(ssl_exc):
                 print(f"[X] - SSL error via proxy {proxy_url}: {ssl_exc}")
+            remove_proxy(proxy_url)
+            increment_stat("failed")
             continue  # retry with another proxy
         except requests.exceptions.RequestException as exc:
             if show_proxy_logs and not is_ignorable_proxy_error(exc):
                 print(f"[X] - Request error via proxy {proxy_url}: {exc}")
+            remove_proxy(proxy_url)
+            increment_stat("failed")
             continue  # retry with another proxy
 
         if response.status_code == 200:
@@ -236,8 +330,10 @@ def checkUsername(username: str) -> bool:
                 continue  # retry
             if valid:
                 print(f"[BINGOOO] - VALID USERNAME FOUND: {username}")
+                increment_stat("valid")
             elif show_proxy_logs:
                 print(f"[✓] - {username} -> taken={taken} ({response_time:.2f}s) via {proxy_url}")
+            increment_stat("completed")
             time.sleep(rate_limit_seconds)  # Add delay after successful request
             return valid
 
@@ -256,6 +352,7 @@ def checkUsername(username: str) -> bool:
             if thread_local.proxy is None:
                 if show_proxy_logs:
                     print(f"[X] - No proxies available after rate limit on {proxy_url}")
+                refresh_proxies()
                 return False
             if show_proxy_logs:
                 print(f"[✓] - Switched to proxy: {thread_local.proxy}")
@@ -264,6 +361,7 @@ def checkUsername(username: str) -> bool:
 
         if show_proxy_logs:
             print(f"[X] - Error: {response.status_code} - {response.text} via {proxy_url}")
+        increment_stat("failed")
         time.sleep(rate_limit_seconds)  # Add delay after other errors
         continue  # retry with another proxy
 
@@ -271,40 +369,115 @@ def checkUsername(username: str) -> bool:
     return False
 
 
-def worker():
+def wait_for_proxy_pool(stop_event: threading.Event) -> bool:
     thread_name = threading.current_thread().name
+
+    while not stop_event.is_set():
+        with proxy_lock:
+            if proxies:
+                return True
+
+        print(f"[X] - {thread_name}: No proxies available, refetching...")
+        if refresh_proxies():
+            return True
+
+        stop_event.wait(proxy_empty_retry_seconds)
+
+    return False
+
+
+def worker(stop_event: threading.Event):
+    thread_name = threading.current_thread().name
+    if not wait_for_proxy_pool(stop_event):
+        return
+
     thread_local.proxy = get_random_proxy()
     if thread_local.proxy is None:
         print(f"[X] - {thread_name}: No proxies available, stopping.")
         return
     if show_proxy_logs:
         print(f"[✓] - {thread_name} started with proxy: {thread_local.proxy}")
-    while True:
+    while not stop_event.is_set():
         with proxy_lock:
             if not proxies:
-                print(f"[X] - {thread_name}: No proxies remaining, stopping.")
-                break
+                print(f"[X] - {thread_name}: No proxies remaining, refetching.")
+
+        if not wait_for_proxy_pool(stop_event):
+            break
 
         if thread_local.proxy is None or thread_local.proxy not in proxies:
             thread_local.proxy = get_random_proxy()
             if thread_local.proxy is None:
-                print(f"[X] - {thread_name}: No proxies available, stopping.")
-                break
+                if not wait_for_proxy_pool(stop_event):
+                    break
+                thread_local.proxy = get_random_proxy()
+                if thread_local.proxy is None:
+                    break
 
         username = pickRandomUsername()
-        if checkUsername(username):
+        if checkUsername(username, stop_event):
             print(f"[BINGOOO] - Valid username found: {username}")
             appendToFile(username)
             send_discord_webhook(username)
 
 
-if __name__ == "__main__":
+def start_workers(stop_event: threading.Event) -> List[threading.Thread]:
     threads = []
     for i in range(threads_number):
-        t = threading.Thread(target=worker, name=f"Worker-{i+1}")
+        t = threading.Thread(target=worker, args=(stop_event,), name=f"Worker-{i+1}")
         t.daemon = True
         threads.append(t)
         t.start()
 
+    print(f"[✓] - Launched {len(threads)} worker threads.")
+    return threads
+
+
+def run_threads_once() -> None:
+    stop_event = threading.Event()
+    threads = start_workers(stop_event)
+
     for t in threads:
         t.join()
+
+
+def run_threads_with_restarts() -> None:
+    cycle = 1
+
+    while True:
+        print(f"[✓] - Starting worker cycle {cycle} with {threads_number} threads.")
+        refresh_proxies(force=True)
+        stop_event = threading.Event()
+        threads = start_workers(stop_event)
+
+        try:
+            cycle_started_at = time.time()
+            while not stop_event.is_set():
+                remaining_seconds = thread_restart_interval_seconds - (time.time() - cycle_started_at)
+                if remaining_seconds <= 0:
+                    break
+                wait_seconds = min(max(1, status_interval_seconds), remaining_seconds)
+                stop_event.wait(wait_seconds)
+                if not stop_event.is_set() and wait_seconds > 0:
+                    log_status(cycle)
+        except KeyboardInterrupt:
+            stop_event.set()
+            raise
+
+        print(f"[✓] - Restarting workers and refreshing proxies after {thread_restart_interval_seconds}s.")
+        stop_event.set()
+        for t in threads:
+            t.join()
+
+        cycle += 1
+
+
+if __name__ == "__main__":
+    try:
+        if thread_restart_interval_seconds and thread_restart_interval_seconds > 0:
+            run_threads_with_restarts()
+        else:
+            refresh_proxies(force=True)
+            run_threads_once()
+    except KeyboardInterrupt:
+        print("\n[✓] - Stopped by user.")
