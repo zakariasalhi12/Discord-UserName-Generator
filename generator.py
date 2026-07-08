@@ -36,12 +36,11 @@ status_interval_seconds = config.get("status_interval_seconds", 10)
 show_proxy_logs = config.get("show_proxy_logs", False)
 result_file = config.get("result_file", "result.txt")
 discord_webhook_url = config.get("discord_webhook_url", "").strip()
+discord_auth_token = config.get("discord_auth_token", "").strip()
 
 characters = [
     'a','b','c','d','e','f','g','h','i','j','k','l','m',
     'n','o','p','q','r','s','t','u','v','w','x','y','z',
-    'A','B','C','D','E','F','G','H','I','J','K','L','M',
-    'N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
     '0','1','2','3','4','5','6','7','8','9','.','_'
 ]
 
@@ -251,6 +250,39 @@ def send_discord_webhook(username: str) -> None:
         print(f"[X] - Discord webhook request failed: {exc}")
 
 
+def change_discord_username(username: str) -> None:
+    """Attempt to change the authenticated Discord account username to `username`.
+
+    Requires `discord_auth_token` to be set in `config.json` as a valid user token.
+    """
+    if not discord_auth_token:
+        if show_proxy_logs:
+            print("[X] - No discord_auth_token provided; skipping username change.")
+        return
+
+    url = "https://discord.com/api/v9/users/@me"
+    headers = session.headers.copy()
+    headers["Authorization"] = discord_auth_token
+
+    payload = {"username": username}
+    try:
+        resp = session.patch(url, json=payload, headers=headers, timeout=10)
+    except requests.exceptions.RequestException as exc:
+        print(f"[X] - Failed to change Discord username: {exc}")
+        return
+
+    if resp.status_code in (200, 204):
+        print(f"[✓] - Discord account username changed to: {username}")
+    elif resp.status_code == 401:
+        print("[X] - Unauthorized: invalid discord_auth_token provided.")
+    else:
+        try:
+            error_text = resp.json()
+        except Exception:
+            error_text = resp.text
+        print(f"[X] - Failed to change username ({resp.status_code}): {error_text}")
+
+
 def pickRandomUsername() -> str:
     username = ""
 
@@ -419,6 +451,14 @@ def worker(stop_event: threading.Event):
             print(f"[BINGOOO] - Valid username found: {username}")
             appendToFile(username)
             send_discord_webhook(username)
+            # If the found username is exactly 3 letters, attempt to change the authenticated
+            # Discord account username to it (requires `discord_auth_token` in config).
+            try:
+                if len(username) == 3:
+                    change_discord_username(username)
+            except Exception:
+                # Don't let username-change failures stop the worker
+                pass
 
 
 def start_workers(stop_event: threading.Event) -> List[threading.Thread]:
