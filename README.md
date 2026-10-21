@@ -131,19 +131,18 @@ with the free sources; set `"proxy_api_urls": []` to rely only on your own list.
 
 ## Output
 
-Each check prints one line with the username and its result:
+Each successful check prints one line with the username and its result:
 
 ```text
 baraka -> taken
-mi7way -> available
+mi7way -> valid
 ```
 
-- `available` — the username is free; it is printed and appended to `result.txt`
+- `valid` — the username is free; it is printed and appended to `result.txt`
 - `taken` — the username is already in use
-- `failed` — the result is unknown (every attempt was rate-limited or errored)
 
-Nothing else is printed, so the output is just the names you tested and whether
-they are valid.
+Checks that could not be completed (rate-limited or errored) are not printed, so
+the output is just the names you tested and whether they are valid.
 
 ## Notes
 
@@ -160,7 +159,7 @@ they are valid.
 
 | Symptom | Cause / fix |
 | --- | --- |
-| Everything is `failed` | No proxy can currently reach Discord. Add your own proxies via `proxy_list_file` or run from an IP that is not rate-limited. |
+| Nothing prints at all | No proxy can currently reach Discord. Add your own proxies via `proxy_list_file` or run from an IP that is not rate-limited. |
 | Batch mode stops early | It stopped after no username could be checked for 2 minutes. Check your proxies and re-run. |
 | Nothing is ever found | Free proxies are the bottleneck. Add your own proxy sources to `proxy_api_urls` or run from an IP that is not rate-limited. |
 

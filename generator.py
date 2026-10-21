@@ -411,9 +411,10 @@ def snapshot_stats() -> Dict[str, int]:
 def print_result(username: str, status: str) -> None:
     """Print the outcome of a single username check.
 
-    This is the only per-check output: the name and whether it is available.
+    Only checks with a known result are printed: the name and whether it is
+    valid. Failed checks are silent.
     """
-    label = {"found": "available", "taken": "taken", "failed": "failed"}.get(status, status)
+    label = {"found": "valid", "taken": "taken"}.get(status, status)
     print(f"{username} -> {label}")
 
 
@@ -595,7 +596,8 @@ def checkUsername(username: str, stop_event: Optional[threading.Event] = None) -
         remove_proxy(proxy_url)
         increment_stat("failed")
 
-    print_result(username, status)
+    if status != "failed":
+        print_result(username, status)
     return status
 
 
