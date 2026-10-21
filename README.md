@@ -9,7 +9,9 @@ making progress even though free proxies are unreliable.
 ## Features
 
 - Random username generation with a configurable length
-- Free proxy discovery from multiple sources, validated against the real Discord endpoint
+- Check a user-supplied list of usernames (batch mode)
+- Use a user-supplied proxy list, or discover free proxies from multiple sources
+- Proxies validated against the real Discord endpoint
 - Background proxy refresher with cooldown-based rotation, so the pool never empties
 - Local-connection fallback when no proxy is usable
 - Discord webhook notifications when a valid username is found
@@ -54,6 +56,8 @@ script uses built-in defaults. Create it next to `generator.py` with the content
 {
   "threads_number": 106,
   "username_length": 4,
+  "usernames_file": "",
+  "proxy_list_file": "",
   "proxy_api_urls": [
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
     "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=http%2Chttps",
@@ -77,11 +81,42 @@ script uses built-in defaults. Create it next to `generator.py` with the content
 | --- | --- |
 | `threads_number` | Number of worker threads |
 | `username_length` | Length of generated usernames (clamped to 2-32) |
-| `proxy_api_urls` | Free proxy sources, tried in order. Plain-text lists (`ip:port`) and JSON APIs are both supported |
+| `usernames_file` | Optional path to a text file of usernames to check instead of generating random ones (one per line) |
+| `proxy_list_file` | Optional path to a text file of proxies to use, e.g. `1.2.3.4:8080` or `http://1.2.3.4:8080` (one per line) |
+| `proxy_api_urls` | Free proxy sources, tried in order. Plain-text lists (`ip:port`) and JSON APIs are both supported. Set to `[]` to disable them and use only `proxy_list_file` |
 | `discord_auth_token` | Optional user token; when set, a found 3-letter username is applied to your account |
 | `discord_webhook_url` | Optional Discord webhook for notifications |
 | `result_file` | Output file for valid usernames |
 | `show_proxy_logs` | Set to `true` for detailed proxy errors and cooldowns |
+
+## Checking a username list
+
+Set `usernames_file` to a text file with one username per line:
+
+```text
+alpha
+beta
+gamma
+```
+
+The script checks each entry once and then exits. Entries are trimmed, lower-cased
+and de-duplicated automatically. If a username cannot be checked because every
+attempt was rate-limited or errored, it is retried (up to 3 times) instead of being
+dropped. Leave `usernames_file` empty to generate random usernames and run forever.
+
+## Using your own proxy list
+
+Set `proxy_list_file` to a text file with one proxy per line:
+
+```text
+1.2.3.4:8080
+http://5.6.7.8:3128
+user:pass@9.10.11.12:3128
+```
+
+The entries are validated against the real Discord endpoint and the working ones are
+added to the pool, so dead entries are filtered out. Your proxies are used together
+with the free sources; set `"proxy_api_urls": []` to rely only on your own list.
 
 ## How it works
 

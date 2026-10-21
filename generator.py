@@ -1,4 +1,5 @@
 import json
+import queue
 import random
 import re
 import threading
@@ -51,6 +52,8 @@ MAX_PROXY_RESPONSE_TIME = 8
 EMPTY_RETRY_SECONDS = 3
 STATUS_INTERVAL = 15
 MAX_ATTEMPTS = 3
+MAX_USERNAME_ATTEMPTS = 3
+BATCH_IDLE_TIMEOUT = 120
 DEFAULT_BACKOFF_SECONDS = 5
 MAX_COOLDOWN_SECONDS = 1800
 
@@ -77,10 +80,19 @@ discord_webhook_url = config.get("discord_webhook_url", "").strip()
 discord_auth_token = config.get("discord_auth_token", "").strip()
 show_proxy_logs = config.get("show_proxy_logs", False)
 
-sources = config.get("proxy_api_urls") or config.get("proxy_sources")
+# Optional user-supplied lists. Leave them empty to use the built-in behaviour
+# (random generation / free proxy sources).
+usernames_file = config.get("usernames_file", "").strip()
+proxy_list_file = config.get("proxy_list_file", "").strip()
+
+# `proxy_api_urls` may be an explicit empty list to disable the free sources and
+# rely only on a user-supplied proxy list.
+sources = config.get("proxy_api_urls", config.get("proxy_sources"))
 if isinstance(sources, str):
     sources = re.split(r"[\s,]+", sources)
-proxy_api_urls = [u.strip() for u in (sources or DEFAULT_PROXY_SOURCES) if u and u.strip()]
+if sources is None:
+    sources = DEFAULT_PROXY_SOURCES
+proxy_api_urls = [u.strip() for u in sources if u and u.strip()]
 
 characters = [
     'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
@@ -302,6 +314,13 @@ thread_local = threading.local()
 
 stats_lock = threading.Lock()
 stats = {"checked": 0, "valid": 0, "failed": 0, "rate_limited": 0}
+
+# Queue of usernames to check when `usernames_file` is configured; None means
+# the workers generate random usernames instead.
+username_queue: Optional["queue.Queue[str]"] = None
+# Retry counter for user-supplied usernames that could not be checked yet.
+username_attempts: Dict[str, int] = {}
+username_attempts_lock = threading.Lock()
 
 
 def format_proxy(proxy_url: str) -> Dict[str, str]:
@@ -529,16 +548,21 @@ def _retry_after_seconds(response) -> float:
         return 0.0
 
 
-def checkUsername(username: str, stop_event: Optional[threading.Event] = None) -> bool:
+def checkUsername(username: str, stop_event: Optional[threading.Event] = None) -> str:
+    """Check one username.
+
+    Returns "found" (available), "taken" (not available) or "failed" (the result
+    is unknown because every attempt errored or was rate-limited).
+    """
     payload = {"username": username}
 
     for _ in range(MAX_ATTEMPTS):
         if stop_event is not None and stop_event.is_set():
-            return False
+            return "failed"
 
         proxy_url = get_working_proxy()
         if proxy_url is None:
-            return False
+            return "failed"
 
         try:
             started_at = time.time()
@@ -575,8 +599,8 @@ def checkUsername(username: str, stop_event: Optional[threading.Event] = None) -
             if not taken:
                 print(f"[BINGOOO] - VALID USERNAME FOUND: {username}")
                 increment_stat("valid")
-                return True
-            return False
+                return "found"
+            return "taken"
 
         if response.status_code == 429:
             retry_after = _retry_after_seconds(response) or DEFAULT_BACKOFF_SECONDS
@@ -590,7 +614,7 @@ def checkUsername(username: str, stop_event: Optional[threading.Event] = None) -
         remove_proxy(proxy_url)
         increment_stat("failed")
 
-    return False
+    return "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -663,18 +687,81 @@ def pickRandomUsername() -> str:
             return username
 
 
+def load_username_list(path: str) -> Optional["queue.Queue[str]"]:
+    """Read usernames from a file into a thread-safe queue (one check each).
+
+    Lines are trimmed, lower-cased and de-duplicated. Returns None when the file
+    is unreadable or empty so the caller can fall back to random generation.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError as exc:
+        print(f"[x] - Could not read usernames file {path}: {exc}")
+        return None
+
+    usernames: "queue.Queue[str]" = queue.Queue()
+    seen = set()
+    for raw in lines:
+        username = raw.strip().lower()
+        if username and username not in seen:
+            seen.add(username)
+            usernames.put(username)
+
+    if usernames.empty():
+        print(f"[x] - No usernames found in {path}")
+        return None
+
+    print(f"[✓] - Loaded {usernames.qsize()} usernames from {path}")
+    return usernames
+
+
+def load_proxy_list_file(path: str) -> List[str]:
+    """Read a local proxy list file and validate the entries."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError as exc:
+        print(f"[x] - Could not read proxy list file {path}: {exc}")
+        return []
+
+    candidates = parse_proxies(raw)
+    if not candidates:
+        print(f"[x] - No valid proxies found in {path}")
+        return []
+
+    if len(candidates) > PROXY_VALIDATION_LIMIT:
+        candidates = candidates[:PROXY_VALIDATION_LIMIT]
+
+    print(f"[✓] - Validating {len(candidates)} proxies from {path}")
+    working = _validate_batch([candidate["url"] for candidate in candidates])
+    if working:
+        add_proxies(working)
+    return working
+
+
 # ---------------------------------------------------------------------------
 # Workers
 # ---------------------------------------------------------------------------
 
 def worker(stop_event: threading.Event) -> None:
     while not stop_event.is_set():
+        # Wait until a proxy is available before taking the next username, so a
+        # username is never skipped just because the pool is temporarily empty.
         if get_working_proxy() is None:
             stop_event.wait(EMPTY_RETRY_SECONDS)
             continue
 
-        username = pickRandomUsername()
-        if checkUsername(username, stop_event):
+        if username_queue is not None:
+            try:
+                username = username_queue.get_nowait()
+            except queue.Empty:
+                return  # every username in the list has been checked
+        else:
+            username = pickRandomUsername()
+
+        status = checkUsername(username, stop_event)
+        if status == "found":
             print(f"[BINGOOO] - Valid username found: {username}")
             appendToFile(username)
             send_discord_webhook(username)
@@ -686,6 +773,19 @@ def worker(stop_event: threading.Event) -> None:
             except Exception:
                 # Don't let username-change failures stop the worker
                 pass
+            username_attempts.pop(username, None)
+        elif status == "failed" and username_queue is not None:
+            # A user-supplied username that could not be checked is put back so
+            # it is retried later (up to a bounded number of attempts).
+            with username_attempts_lock:
+                attempts = username_attempts.get(username, 0) + 1
+                retry = attempts < MAX_USERNAME_ATTEMPTS
+                if retry:
+                    username_attempts[username] = attempts
+                else:
+                    username_attempts.pop(username, None)
+            if retry:
+                username_queue.put(username)
 
 
 def start_workers(stop_event: threading.Event) -> List[threading.Thread]:
@@ -701,13 +801,53 @@ def start_workers(stop_event: threading.Event) -> List[threading.Thread]:
 
 
 def run() -> None:
+    global username_queue
+
     stop_event = threading.Event()
 
     print(f"[✓] - Sources: {len(proxy_api_urls)} | Workers: {threads_number} | Username length: {username_length}")
-    refresher = threading.Thread(target=proxy_refresher, args=(stop_event,), name="ProxyRefresher", daemon=True)
-    refresher.start()
+
+    if usernames_file:
+        username_queue = load_username_list(usernames_file)
+        if username_queue is not None:
+            print(f"[✓] - Batch mode: checking {username_queue.qsize()} usernames from {usernames_file}")
+        else:
+            print("[i] - Falling back to random username generation")
+
+    # A user-supplied proxy list is validated up front and added to the pool. The
+    # free-source refresher keeps running as a fallback unless proxy_api_urls is
+    # explicitly empty.
+    if proxy_list_file:
+        load_proxy_list_file(proxy_list_file)
+
+    if proxy_api_urls:
+        refresher = threading.Thread(target=proxy_refresher, args=(stop_event,), name="ProxyRefresher", daemon=True)
+        refresher.start()
 
     threads = start_workers(stop_event)
+
+    if username_queue is not None:
+        # Batch mode: exit once every username in the list has been checked.
+        # If no username can be checked for a while (e.g. every proxy is
+        # rate-limited), stop instead of waiting forever.
+        last_checked = snapshot_stats()["checked"]
+        last_progress = time.time()
+        for t in threads:
+            while t.is_alive():
+                t.join(timeout=1)
+                now = time.time()
+                current_checked = snapshot_stats()["checked"]
+                if current_checked != last_checked:
+                    last_checked = current_checked
+                    last_progress = now
+                elif now - last_progress > BATCH_IDLE_TIMEOUT:
+                    print(f"[x] - No username could be checked for {BATCH_IDLE_TIMEOUT}s; stopping.")
+                    stop_event.set()
+                    break
+        for t in threads:
+            t.join(timeout=2)
+        print(f"[✓] - Username list processed. {snapshot_stats()}")
+        return
 
     last_status = time.time()
     cycle = 1
