@@ -50,7 +50,6 @@ VALIDATION_USERNAME = "zzqtest"
 REQUEST_TIMEOUT = 10
 MAX_PROXY_RESPONSE_TIME = 8
 EMPTY_RETRY_SECONDS = 3
-STATUS_INTERVAL = 15
 MAX_ATTEMPTS = 3
 MAX_USERNAME_ATTEMPTS = 3
 BATCH_IDLE_TIMEOUT = 120
@@ -64,10 +63,9 @@ def load_config(config_file: str = "config.json") -> Dict:
         with open(config_file, "r", encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
-        print(f"[i] - No config file at {config_file}; using defaults.")
         return {}
     except json.JSONDecodeError:
-        print(f"[x] - Invalid JSON in {config_file}; using defaults.")
+        print(f"Invalid JSON in {config_file}; using defaults.")
         return {}
 
 
@@ -78,7 +76,6 @@ threads_number = config.get("threads_number", 16)
 result_file = config.get("result_file", "result.txt")
 discord_webhook_url = config.get("discord_webhook_url", "").strip()
 discord_auth_token = config.get("discord_auth_token", "").strip()
-show_proxy_logs = config.get("show_proxy_logs", False)
 
 # Optional user-supplied lists. Leave them empty to use the built-in behaviour
 # (random generation / free proxy sources).
@@ -333,12 +330,14 @@ def add_proxies(new_urls: List[str]) -> None:
     """Merge freshly validated proxies into the pool, capping its size."""
     global proxies, proxy_count
 
-    added = 0
+def add_proxies(new_urls: List[str]) -> None:
+    """Merge freshly validated proxies into the pool, capping its size."""
+    global proxies, proxy_count
+
     with proxy_lock:
         for url in new_urls:
             if url not in proxies:
                 proxies.append(url)
-                added += 1
 
         if len(proxies) > MAX_POOL_SIZE:
             # Evict the oldest non-cooling proxies to keep the pool bounded.
@@ -355,9 +354,6 @@ def add_proxies(new_urls: List[str]) -> None:
 
         proxy_count = len(proxies)
 
-    if added:
-        print(f"[✓] - Added {added} working proxies (pool: {proxy_count})")
-
 
 def remove_proxy(proxy_url: str, reason: str = "failure") -> None:
     global proxy_count
@@ -372,9 +368,6 @@ def remove_proxy(proxy_url: str, reason: str = "failure") -> None:
             proxies.remove(proxy_url)
             proxy_count = len(proxies)
             proxy_cooldowns.pop(proxy_url, None)
-            if show_proxy_logs:
-                label = "slow" if reason == "timeout" else reason
-                print(f"[x] - Removed {label} proxy: {proxy_url} (remaining {proxy_count})")
 
 
 def mark_proxy_cooldown(proxy_url: str, seconds: float) -> None:
@@ -415,18 +408,13 @@ def snapshot_stats() -> Dict[str, int]:
         return dict(stats)
 
 
-def log_status(cycle: int) -> None:
-    now = time.time()
-    with proxy_lock:
-        total = proxy_count
-        cooling = sum(1 for p in proxies if proxy_cooldowns.get(p, 0.0) > now)
-        direct_cooling = proxy_cooldowns.get(DIRECT_PROXY, 0.0) > now
-    s = snapshot_stats()
-    print(
-        f"[✓] - Cycle {cycle} | checked={s['checked']} valid={s['valid']} "
-        f"failed={s['failed']} rate_limited={s['rate_limited']} | "
-        f"proxies={total} cooling={cooling} direct={'cooling' if direct_cooling else 'ready'}"
-    )
+def print_result(username: str, status: str) -> None:
+    """Print the outcome of a single username check.
+
+    This is the only per-check output: the name and whether it is available.
+    """
+    label = {"found": "available", "taken": "taken", "failed": "failed"}.get(status, status)
+    print(f"{username} -> {label}")
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +462,6 @@ def _validate_batch(urls: List[str]) -> List[str]:
         for result in executor.map(_validate_single_proxy, urls):
             if result is not None:
                 working.append(result)
-    print(f"[✓] - Validated {len(working)}/{len(urls)} working proxies")
     return working
 
 
@@ -482,13 +469,10 @@ def _fetch_candidates(api_url: str) -> List[Dict]:
     try:
         response = requests.get(api_url, timeout=PROXY_FETCH_TIMEOUT)
         response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        print(f"[x] - Failed to fetch {api_url}: {e}")
+    except requests.exceptions.RequestException:
         return []
 
-    candidates = parse_proxies(response.text)
-    print(f"[✓] - Fetched {len(candidates)} candidates from {api_url}")
-    return candidates
+    return parse_proxies(response.text)
 
 
 def _gather_candidates() -> List[Dict]:
@@ -529,8 +513,9 @@ def proxy_refresher(stop_event: threading.Event) -> None:
                 valid = _validate_batch([c["url"] for c in fresh[i:i + PROXY_VALIDATION_CHUNK]])
                 if valid:
                     add_proxies(valid)
-        except Exception as exc:  # never let the refresher die
-            print(f"[x] - Proxy refresh error: {exc}")
+        except Exception:
+            # Never let a refresh error kill the refresher thread.
+            pass
 
         elapsed = time.time() - started_at
         stop_event.wait(max(1, PROXY_REFRESH_INTERVAL - elapsed))
@@ -555,14 +540,15 @@ def checkUsername(username: str, stop_event: Optional[threading.Event] = None) -
     is unknown because every attempt errored or was rate-limited).
     """
     payload = {"username": username}
+    status = "failed"
 
     for _ in range(MAX_ATTEMPTS):
         if stop_event is not None and stop_event.is_set():
-            return "failed"
+            break
 
         proxy_url = get_working_proxy()
         if proxy_url is None:
-            return "failed"
+            break
 
         try:
             started_at = time.time()
@@ -577,9 +563,7 @@ def checkUsername(username: str, stop_event: Optional[threading.Event] = None) -
             remove_proxy(proxy_url, reason="timeout")
             increment_stat("failed")
             continue
-        except requests.exceptions.RequestException as exc:
-            if show_proxy_logs:
-                print(f"[x] - Request error via {proxy_url}: {exc}")
+        except requests.exceptions.RequestException:
             remove_proxy(proxy_url)
             increment_stat("failed")
             continue
@@ -597,24 +581,22 @@ def checkUsername(username: str, stop_event: Optional[threading.Event] = None) -
                 continue
             increment_stat("checked")
             if not taken:
-                print(f"[BINGOOO] - VALID USERNAME FOUND: {username}")
                 increment_stat("valid")
-                return "found"
-            return "taken"
+                status = "found"
+            else:
+                status = "taken"
+            break
 
         if response.status_code == 429:
             retry_after = _retry_after_seconds(response) or DEFAULT_BACKOFF_SECONDS
-            if show_proxy_logs:
-                print(f"[x] - Rate limited (429) via {proxy_url}; cooling down {retry_after:.0f}s")
             mark_proxy_cooldown(proxy_url, retry_after)
             continue
 
-        if show_proxy_logs:
-            print(f"[x] - Unexpected {response.status_code} via {proxy_url}: {response.text[:80]}")
         remove_proxy(proxy_url)
         increment_stat("failed")
 
-    return "failed"
+    print_result(username, status)
+    return status
 
 
 # ---------------------------------------------------------------------------
@@ -624,7 +606,6 @@ def checkUsername(username: str, stop_event: Optional[threading.Event] = None) -
 def appendToFile(username: str) -> None:
     with open(result_file, "a", encoding="utf-8") as f:
         f.write(username + "\n")
-    print(f"[✓] - Appended {username} to {result_file}")
 
 
 def send_discord_webhook(username: str) -> None:
@@ -633,14 +614,9 @@ def send_discord_webhook(username: str) -> None:
 
     payload = {"content": f"[+] username found: {username}"}
     try:
-        response = session.post(discord_webhook_url, json=payload, timeout=10)
-        if response.status_code in (200, 204):
-            if show_proxy_logs:
-                print(f"[✓] - Sent webhook notification for {username}")
-        else:
-            print(f"[x] - Webhook send failed ({response.status_code}): {response.text}")
-    except requests.exceptions.RequestException as exc:
-        print(f"[x] - Discord webhook request failed: {exc}")
+        session.post(discord_webhook_url, json=payload, timeout=10)
+    except requests.exceptions.RequestException:
+        pass
 
 
 def change_discord_username(username: str) -> None:
@@ -649,8 +625,6 @@ def change_discord_username(username: str) -> None:
     Requires `discord_auth_token` to be set in `config.json` as a valid user token.
     """
     if not discord_auth_token:
-        if show_proxy_logs:
-            print("[x] - No discord_auth_token provided; skipping username change.")
         return
 
     url = "https://discord.com/api/v9/users/@me"
@@ -660,20 +634,19 @@ def change_discord_username(username: str) -> None:
     payload = {"username": username}
     try:
         resp = session.patch(url, json=payload, headers=headers, timeout=10)
-    except requests.exceptions.RequestException as exc:
-        print(f"[x] - Failed to change Discord username: {exc}")
+    except requests.exceptions.RequestException:
         return
 
     if resp.status_code in (200, 204):
-        print(f"[✓] - Discord account username changed to: {username}")
+        print(f"Discord username changed to: {username}")
     elif resp.status_code == 401:
-        print("[x] - Unauthorized: invalid discord_auth_token provided.")
+        print("Unauthorized: invalid discord_auth_token provided.")
     else:
         try:
             error_text = resp.json()
         except Exception:
             error_text = resp.text
-        print(f"[x] - Failed to change username ({resp.status_code}): {error_text}")
+        print(f"Failed to change username ({resp.status_code}): {error_text}")
 
 
 def pickRandomUsername() -> str:
@@ -697,7 +670,7 @@ def load_username_list(path: str) -> Optional["queue.Queue[str]"]:
         with open(path, "r", encoding="utf-8") as f:
             lines = f.read().splitlines()
     except OSError as exc:
-        print(f"[x] - Could not read usernames file {path}: {exc}")
+        print(f"Could not read usernames file {path}: {exc}")
         return None
 
     usernames: "queue.Queue[str]" = queue.Queue()
@@ -709,10 +682,9 @@ def load_username_list(path: str) -> Optional["queue.Queue[str]"]:
             usernames.put(username)
 
     if usernames.empty():
-        print(f"[x] - No usernames found in {path}")
+        print(f"No usernames found in {path}")
         return None
 
-    print(f"[✓] - Loaded {usernames.qsize()} usernames from {path}")
     return usernames
 
 
@@ -722,18 +694,17 @@ def load_proxy_list_file(path: str) -> List[str]:
         with open(path, "r", encoding="utf-8") as f:
             raw = f.read()
     except OSError as exc:
-        print(f"[x] - Could not read proxy list file {path}: {exc}")
+        print(f"Could not read proxy list file {path}: {exc}")
         return []
 
     candidates = parse_proxies(raw)
     if not candidates:
-        print(f"[x] - No valid proxies found in {path}")
+        print(f"No valid proxies found in {path}")
         return []
 
     if len(candidates) > PROXY_VALIDATION_LIMIT:
         candidates = candidates[:PROXY_VALIDATION_LIMIT]
 
-    print(f"[✓] - Validating {len(candidates)} proxies from {path}")
     working = _validate_batch([candidate["url"] for candidate in candidates])
     if working:
         add_proxies(working)
@@ -762,7 +733,6 @@ def worker(stop_event: threading.Event) -> None:
 
         status = checkUsername(username, stop_event)
         if status == "found":
-            print(f"[BINGOOO] - Valid username found: {username}")
             appendToFile(username)
             send_discord_webhook(username)
             # If the found username is exactly 3 letters, attempt to change the
@@ -796,7 +766,6 @@ def start_workers(stop_event: threading.Event) -> List[threading.Thread]:
         threads.append(t)
         t.start()
 
-    print(f"[✓] - Launched {len(threads)} workers.")
     return threads
 
 
@@ -805,14 +774,8 @@ def run() -> None:
 
     stop_event = threading.Event()
 
-    print(f"[✓] - Sources: {len(proxy_api_urls)} | Workers: {threads_number} | Username length: {username_length}")
-
     if usernames_file:
         username_queue = load_username_list(usernames_file)
-        if username_queue is not None:
-            print(f"[✓] - Batch mode: checking {username_queue.qsize()} usernames from {usernames_file}")
-        else:
-            print("[i] - Falling back to random username generation")
 
     # A user-supplied proxy list is validated up front and added to the pool. The
     # free-source refresher keeps running as a fallback unless proxy_api_urls is
@@ -841,29 +804,20 @@ def run() -> None:
                     last_checked = current_checked
                     last_progress = now
                 elif now - last_progress > BATCH_IDLE_TIMEOUT:
-                    print(f"[x] - No username could be checked for {BATCH_IDLE_TIMEOUT}s; stopping.")
+                    print(f"No username could be checked for {BATCH_IDLE_TIMEOUT}s; stopping.")
                     stop_event.set()
                     break
         for t in threads:
             t.join(timeout=2)
-        print(f"[✓] - Username list processed. {snapshot_stats()}")
         return
 
-    last_status = time.time()
-    cycle = 1
     try:
         while not stop_event.is_set():
             stop_event.wait(1)
-            now = time.time()
-            if now - last_status >= STATUS_INTERVAL:
-                log_status(cycle)
-                cycle += 1
-                last_status = now
     except KeyboardInterrupt:
         stop_event.set()
         for t in threads:
             t.join()
-        print("\n[✓] - Stopped by user.")
 
 
 if __name__ == "__main__":

@@ -68,8 +68,7 @@ script uses built-in defaults. Create it next to `generator.py` with the content
   ],
   "discord_auth_token": "",
   "discord_webhook_url": "",
-  "result_file": "result.txt",
-  "show_proxy_logs": false
+  "result_file": "result.txt"
 }
 ```
 
@@ -87,7 +86,6 @@ script uses built-in defaults. Create it next to `generator.py` with the content
 | `discord_auth_token` | Optional user token; when set, a found 3-letter username is applied to your account |
 | `discord_webhook_url` | Optional Discord webhook for notifications |
 | `result_file` | Output file for valid usernames |
-| `show_proxy_logs` | Set to `true` for detailed proxy errors and cooldowns |
 
 ## Checking a username list
 
@@ -133,11 +131,19 @@ with the free sources; set `"proxy_api_urls": []` to rely only on your own list.
 
 ## Output
 
-- **Always visible**: valid usernames (`[BINGOOO] - VALID USERNAME FOUND: ...`)
-- **Periodic status**: `checked`, `valid`, `failed`, `rate_limited` and the proxy pool size
-- **With `show_proxy_logs = true`**: detailed proxy errors and cooldowns
+Each check prints one line with the username and its result:
 
-Valid usernames are also appended to `result.txt`.
+```text
+baraka -> taken
+mi7way -> available
+```
+
+- `available` — the username is free; it is printed and appended to `result.txt`
+- `taken` — the username is already in use
+- `failed` — the result is unknown (every attempt was rate-limited or errored)
+
+Nothing else is printed, so the output is just the names you tested and whether
+they are valid.
 
 ## Notes
 
@@ -154,8 +160,8 @@ Valid usernames are also appended to `result.txt`.
 
 | Symptom | Cause / fix |
 | --- | --- |
-| `checked=0` right after start | Normal for the first minute; the refresher is still validating candidates. It rises as working proxies are found. |
-| `proxies=0` | No proxy validated in the current refresh round. The refresher keeps trying; the local connection is used meanwhile. |
+| Everything is `failed` | No proxy can currently reach Discord. Add your own proxies via `proxy_list_file` or run from an IP that is not rate-limited. |
+| Batch mode stops early | It stopped after no username could be checked for 2 minutes. Check your proxies and re-run. |
 | Nothing is ever found | Free proxies are the bottleneck. Add your own proxy sources to `proxy_api_urls` or run from an IP that is not rate-limited. |
 
 ## Disclaimer
