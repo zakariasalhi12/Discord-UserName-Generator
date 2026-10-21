@@ -1,10 +1,59 @@
-import random
-import requests
-import time
-import threading
-import urllib3
 import json
+import random
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
+from urllib.parse import quote, urlsplit
+
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+DEFAULT_ENDPOINT = "https://discord.com/api/v9/unique-username/username-attempt-unauthed"
+
+DEFAULT_PROXY_SOURCES = [
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=http%2Chttps",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://api.openproxylist.xyz/http.txt",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text",
+]
+
+# Sentinel used for the local machine's own connection when no proxy is usable.
+DIRECT_PROXY = "__direct__"
+
+# ---------------------------------------------------------------------------
+# Internal tuning. Deliberately kept out of config.json so the tool has a small,
+# opinionated configuration surface and "just works" out of the box.
+#
+# Free proxies are unreliable: only a small fraction can actually reach Discord,
+# and each usable IP allows ~15-20 requests before a long cooldown. The tool
+# therefore validates a large candidate pool in the background and rotates on
+# cooldowns rather than deleting proxies.
+# ---------------------------------------------------------------------------
+PROXY_FETCH_TIMEOUT = 15
+PROXY_VALIDATION_TIMEOUT = 3
+PROXY_VALIDATION_WORKERS = 350
+PROXY_VALIDATION_CHUNK = 2000
+PROXY_VALIDATION_LIMIT = 12000
+PROXY_MIN_UP_TIME = 80
+PROXY_MAX_LATENCY_MS = 3000
+PROXY_REFRESH_INTERVAL = 20
+MAX_POOL_SIZE = 800
+VALIDATION_USERNAME = "zzqtest"
+
+REQUEST_TIMEOUT = 10
+MAX_PROXY_RESPONSE_TIME = 8
+EMPTY_RETRY_SECONDS = 3
+STATUS_INTERVAL = 15
+MAX_ATTEMPTS = 3
+DEFAULT_BACKOFF_SECONDS = 5
+MAX_COOLDOWN_SECONDS = 1800
+
 
 def load_config(config_file: str = "config.json") -> Dict:
     """Load configuration from JSON file"""
@@ -12,88 +61,231 @@ def load_config(config_file: str = "config.json") -> Dict:
         with open(config_file, "r", encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
-        print(f"[✓] - Config file not found: {config_file}")
+        print(f"[i] - No config file at {config_file}; using defaults.")
         return {}
     except json.JSONDecodeError:
-        print(f"[✗] - Invalid JSON in config file: {config_file}")
+        print(f"[x] - Invalid JSON in {config_file}; using defaults.")
         return {}
 
-# Load configuration
+
 config = load_config()
-endpoint = config.get("endpoint", "https://discord.com/api/v9/unique-username/username-attempt-unauthed")
-proxy_api_url = config.get("proxy_api_url", "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=619")
+endpoint = config.get("endpoint", DEFAULT_ENDPOINT)
 username_length = config.get("username_length", 4)
-rate_limit_seconds = config.get("rate_limit_seconds", 0)
-rate_limit_backoff = config.get("rate_limit_backoff", 5)
-max_proxy_response_time = config.get("max_proxy_response_time", 9)
-proxy_fail_limit = config.get("proxy_fail_limit", 2)
-threads_number = config.get("threads_number", 3)
-proxy_refresh_interval_seconds = config.get("proxy_refresh_interval_seconds", 60)
-thread_restart_interval_seconds = config.get("thread_restart_interval_seconds", 60)
-proxy_empty_retry_seconds = config.get("proxy_empty_retry_seconds", 5)
-request_timeout_seconds = config.get("request_timeout_seconds", 10)
-status_interval_seconds = config.get("status_interval_seconds", 10)
-show_proxy_logs = config.get("show_proxy_logs", False)
+threads_number = config.get("threads_number", 16)
 result_file = config.get("result_file", "result.txt")
 discord_webhook_url = config.get("discord_webhook_url", "").strip()
 discord_auth_token = config.get("discord_auth_token", "").strip()
+show_proxy_logs = config.get("show_proxy_logs", False)
+
+sources = config.get("proxy_api_urls") or config.get("proxy_sources")
+if isinstance(sources, str):
+    sources = re.split(r"[\s,]+", sources)
+proxy_api_urls = [u.strip() for u in (sources or DEFAULT_PROXY_SOURCES) if u and u.strip()]
 
 characters = [
-    'a','b','c','d','e','f','g','h','i','j','k','l','m',
-    'n','o','p','q','r','s','t','u','v','w','x','y','z',
-    '0','1','2','3','4','5','6','7','8','9','.','_'
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+    'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '_'
 ]
+# Discord rejects usernames with leading/trailing dots or consecutive dots, so
+# never start a generated username with a separator.
+SAFE_FIRST_CHARS = [c for c in characters if c not in "._"]
 
-characters_len = len(characters)
+# requests only routes http:// and https:// proxies through the mapping we build
+# in format_proxy(); SOCKS entries would need the optional requests[socks] extra.
+SUPPORTED_PROXY_SCHEMES = {"http", "https"}
+PROXY_ENTRY_SEPARATORS = re.compile(r"[\s,;]+")
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-def load_proxies(api_url: str) -> List[str]:
-    proxy_urls: List[str] = []
+# ---------------------------------------------------------------------------
+# Proxy parsing
+# ---------------------------------------------------------------------------
+
+def _normalize_proxy(entry: str) -> Optional[str]:
+    """Turn one proxy entry into a canonical http(s)://host:port URL."""
+    candidate = entry.strip().strip("\"'").strip().rstrip(",;")
+    if not candidate or candidate.startswith("#"):
+        return None
+
+    # Free proxy lists are inconsistent: some entries include the scheme, most do not.
+    if "://" not in candidate:
+        candidate = f"http://{candidate}"
 
     try:
-        print("[✓] - Fetching proxies from API...")
-        response = requests.get(api_url, timeout=10)
-        response.raise_for_status()
-        
-        for raw_line in response.text.split('\n'):
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
+        parts = urlsplit(candidate)
+        scheme = parts.scheme.lower()
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        return None
 
-            proxy_url = line
-            if "://" not in proxy_url:
-                proxy_url = f"http://{proxy_url}"
+    if scheme not in SUPPORTED_PROXY_SCHEMES or not host or port is None:
+        return None
+    if port < 1 or port > 65535:
+        return None
 
-            proxy_urls.append(proxy_url)
-        
-        print(f"[✓] - Loaded {len(proxy_urls)} proxies from API")
-    except requests.exceptions.RequestException as e:
-        print(f"[✗] - Failed to fetch proxies from API: {e}")
+    # Skip placeholder entries such as 0.0.0.0:80.
+    if host in {"0.0.0.0", "127.0.0.1", "localhost"}:
+        return None
 
-    return proxy_urls
+    if ":" in host:  # IPv6
+        host = f"[{host}]"
+
+    credentials = ""
+    if parts.username:
+        credentials = quote(parts.username, safe="")
+        if parts.password:
+            credentials += f":{quote(parts.password, safe='')}"
+        credentials += "@"
+
+    return f"{scheme}://{credentials}{host}:{port}"
 
 
-def format_proxy(proxy_url: str) -> Dict[str, str]:
-    return {"http": proxy_url, "https": proxy_url}
+def _candidate_from_json_object(obj: Dict) -> Optional[Dict]:
+    """Turn one JSON proxy object into a candidate dict, or None if unusable.
+
+    Handles the shapes returned by Geonode (`{"ip": ..., "port": ..., "upTime":
+    ..., "responseTime": ...}`) and generic `{"proxy": "ip:port"}` objects.
+    """
+    if not isinstance(obj, dict):
+        return None
+
+    ip = obj.get("ip") or obj.get("host")
+    port = obj.get("port")
+    if ip and port is not None:
+        entry = f"{ip}:{port}"
+    else:
+        proxy_field = obj.get("proxy") or obj.get("address")
+        if not isinstance(proxy_field, str) or not proxy_field.strip():
+            return None
+        entry = proxy_field.strip()
+
+    candidate = {"entry": entry}
+
+    up_time = obj.get("upTime")
+    if isinstance(up_time, (int, float)):
+        candidate["up_time"] = float(up_time)
+
+    # Geonode exposes both; responseTime is the most recent measurement.
+    latency = obj.get("responseTime")
+    if not isinstance(latency, (int, float)):
+        latency = obj.get("latency")
+    if isinstance(latency, (int, float)):
+        candidate["latency_ms"] = float(latency)
+
+    return candidate
 
 
-proxies: List[str] = []
-proxy_count = 0
-proxy_lock = threading.RLock()
-proxy_refresh_lock = threading.Lock()
-proxy_failures: Dict[str, int] = {}
-proxy_response_times: Dict[str, float] = {}  # Track response times per proxy
-proxy_index = 0
-last_proxy_refresh = 0.0
-thread_local = threading.local()
-stats_lock = threading.Lock()
-stats = {
-    "started": 0,
-    "completed": 0,
-    "failed": 0,
-    "valid": 0,
-}
+def _flatten_proxy_payload(payload) -> List[Dict]:
+    """Extract proxy candidate dicts from the different JSON shapes proxy APIs return."""
+    entries: List[Dict] = []
+
+    if isinstance(payload, str):
+        entries.extend({"entry": part} for part in PROXY_ENTRY_SEPARATORS.split(payload) if part)
+    elif isinstance(payload, (list, tuple)):
+        for item in payload:
+            entries.extend(_flatten_proxy_payload(item))
+    elif isinstance(payload, dict):
+        # Common shapes: {"proxy": "ip:port"}, {"ip": "...", "port": 8080},
+        # {"proxies": [...]}, {"data": [...]}, {"results": [...]}
+        if ("ip" in payload and "port" in payload) or (
+            isinstance(payload.get("proxy"), str) and payload["proxy"].strip()
+        ):
+            candidate = _candidate_from_json_object(payload)
+            if candidate:
+                entries.append(candidate)
+                return entries
+        else:
+            for key in ("proxies", "data", "results", "items", "list", "servers"):
+                if key in payload:
+                    entries.extend(_flatten_proxy_payload(payload[key]))
+                    return entries
+            for value in payload.values():
+                entries.extend(_flatten_proxy_payload(value))
+
+    return entries
+
+
+def _proxy_quality_score(candidate: Dict) -> float:
+    """Rank proxy candidates; higher is better.
+
+    Metadata-rich JSON sources (Geonode) rank above plain-text lists, and within
+    a source the healthiest entries (high up-time, low latency) come first.
+    """
+    score = 0.0
+    up_time = candidate.get("up_time")
+    latency = candidate.get("latency_ms")
+    if isinstance(up_time, (int, float)):
+        score += min(float(up_time), 100.0)
+    if isinstance(latency, (int, float)):
+        # Latency is in ms; reward anything under roughly 3s.
+        score += max(0.0, 30.0 - float(latency) / 100.0)
+    return score
+
+
+def parse_proxies(raw_text: str) -> List[Dict]:
+    """Parse a proxy API response into deduplicated, quality-ranked candidates.
+
+    Returns a list of dicts with a ``url`` key. Sources that expose quality
+    metadata (Geonode-style JSON) also carry ``up_time`` and ``latency_ms`` so
+    the healthiest entries are validated first. Supports plain text lists
+    (`ip:port`, `scheme://ip:port`), comma/whitespace separated lists, and
+    common JSON response formats.
+    """
+    if not raw_text or not raw_text.strip():
+        return []
+
+    stripped = raw_text.strip()
+    candidates: List[Dict] = []
+
+    if stripped[0] in "[{":
+        try:
+            candidates = _flatten_proxy_payload(json.loads(stripped))
+        except json.JSONDecodeError:
+            candidates = []
+
+    if not candidates:
+        candidates = [
+            {"entry": part}
+            for part in PROXY_ENTRY_SEPARATORS.split(stripped)
+            if part
+        ]
+
+    proxies: List[Dict] = []
+    seen = set()
+    for candidate in candidates:
+        proxy_url = _normalize_proxy(candidate.get("entry", ""))
+        if not proxy_url or proxy_url in seen:
+            continue
+        seen.add(proxy_url)
+        proxies.append({
+            "url": proxy_url,
+            "up_time": candidate.get("up_time"),
+            "latency_ms": candidate.get("latency_ms"),
+        })
+
+    # Quality-aware entries first; plain-text lists keep their original order.
+    proxies.sort(key=_proxy_quality_score, reverse=True)
+    return proxies
+
+
+def _quality_gate(candidates: List[Dict]) -> List[Dict]:
+    """Drop candidates whose reported quality is below the configured thresholds."""
+    gated: List[Dict] = []
+    for candidate in candidates:
+        up_time = candidate.get("up_time")
+        latency = candidate.get("latency_ms")
+        if up_time is not None and up_time < PROXY_MIN_UP_TIME:
+            continue
+        if latency is not None and latency > PROXY_MAX_LATENCY_MS:
+            continue
+        gated.append(candidate)
+    return gated
+
+
+# ---------------------------------------------------------------------------
+# Proxy pool
+# ---------------------------------------------------------------------------
 
 session = requests.Session()
 session.trust_env = False
@@ -102,88 +294,96 @@ session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 })
 
+proxies: List[str] = []
+proxy_count = 0
+proxy_cooldowns: Dict[str, float] = {}  # proxy -> time.time() when it becomes usable again
+proxy_lock = threading.RLock()
+thread_local = threading.local()
 
-def replace_proxies(proxy_urls: List[str]) -> None:
-    global proxies, proxy_count, proxy_index
+stats_lock = threading.Lock()
+stats = {"checked": 0, "valid": 0, "failed": 0, "rate_limited": 0}
 
-    unique_proxy_urls = list(dict.fromkeys(proxy_urls))
+
+def format_proxy(proxy_url: str) -> Dict[str, str]:
+    if proxy_url == DIRECT_PROXY:
+        return {}
+    return {"http": proxy_url, "https": proxy_url}
+
+
+def add_proxies(new_urls: List[str]) -> None:
+    """Merge freshly validated proxies into the pool, capping its size."""
+    global proxies, proxy_count
+
+    added = 0
     with proxy_lock:
-        proxies = unique_proxy_urls
+        for url in new_urls:
+            if url not in proxies:
+                proxies.append(url)
+                added += 1
+
+        if len(proxies) > MAX_POOL_SIZE:
+            # Evict the oldest non-cooling proxies to keep the pool bounded.
+            excess = len(proxies) - MAX_POOL_SIZE
+            now = time.time()
+            kept: List[str] = []
+            for p in proxies:
+                if excess > 0 and proxy_cooldowns.get(p, 0.0) <= now:
+                    excess -= 1
+                    proxy_cooldowns.pop(p, None)
+                else:
+                    kept.append(p)
+            proxies = kept
+
         proxy_count = len(proxies)
-        proxy_index = 0
-        proxy_failures.clear()
-        proxy_response_times.clear()
 
-
-def refresh_proxies(force: bool = False) -> bool:
-    global last_proxy_refresh
-
-    now = time.time()
-    if not force and proxy_refresh_interval_seconds > 0:
-        with proxy_lock:
-            elapsed_since_refresh = now - last_proxy_refresh
-            if proxies and elapsed_since_refresh < proxy_refresh_interval_seconds:
-                return True
-            if not proxies and elapsed_since_refresh < proxy_empty_retry_seconds:
-                return False
-
-    with proxy_refresh_lock:
-        now = time.time()
-        if not force and proxy_refresh_interval_seconds > 0:
-            with proxy_lock:
-                elapsed_since_refresh = now - last_proxy_refresh
-                if proxies and elapsed_since_refresh < proxy_refresh_interval_seconds:
-                    return True
-                if not proxies and elapsed_since_refresh < proxy_empty_retry_seconds:
-                    return False
-
-        proxy_urls = load_proxies(proxy_api_url)
-        last_proxy_refresh = time.time()
-        if not proxy_urls:
-            with proxy_lock:
-                has_existing_proxies = bool(proxies)
-            if has_existing_proxies:
-                print("[X] - Proxy refresh failed; keeping existing proxy list.")
-            return has_existing_proxies
-
-        replace_proxies(proxy_urls)
-        return True
-
-
-def get_random_proxy() -> Optional[str]:
-    with proxy_lock:
-        if proxy_count == 0 or not proxies:
-            return None
-        return random.choice(proxies)
-
-
-def get_next_proxy() -> Optional[str]:
-    global proxy_index
-    with proxy_lock:
-        if proxy_count == 0 or not proxies:
-            return None
-        proxy = proxies[proxy_index % proxy_count]
-        proxy_index += 1
-        return proxy
+    if added:
+        print(f"[✓] - Added {added} working proxies (pool: {proxy_count})")
 
 
 def remove_proxy(proxy_url: str, reason: str = "failure") -> None:
-    global proxies, proxy_count
+    global proxy_count
+
+    # The local connection is a fallback, not a pool entry: never drop its
+    # cooldown, otherwise it gets hammered again immediately.
+    if proxy_url == DIRECT_PROXY:
+        return
 
     with proxy_lock:
         if proxy_url in proxies:
             proxies.remove(proxy_url)
             proxy_count = len(proxies)
-            if thread_local is not None and getattr(thread_local, 'proxy', None) == proxy_url:
-                thread_local.proxy = None
+            proxy_cooldowns.pop(proxy_url, None)
             if show_proxy_logs:
-                if reason == "timeout":
-                    print(f"[X] - Removed slow proxy (>{max_proxy_response_time}s): {proxy_url} (remaining {proxy_count})")
-                else:
-                    print(f"[X] - Removed failing proxy: {proxy_url} (remaining {proxy_count})")
-        # Clean up tracking data
-        if proxy_url in proxy_response_times:
-            del proxy_response_times[proxy_url]
+                label = "slow" if reason == "timeout" else reason
+                print(f"[x] - Removed {label} proxy: {proxy_url} (remaining {proxy_count})")
+
+
+def mark_proxy_cooldown(proxy_url: str, seconds: float) -> None:
+    """Park a rate-limited proxy instead of deleting it; it may recover later."""
+    seconds = max(1.0, min(float(seconds), MAX_COOLDOWN_SECONDS))
+    with proxy_lock:
+        proxy_cooldowns[proxy_url] = time.time() + seconds
+    increment_stat("rate_limited")
+
+
+def available_proxies() -> List[str]:
+    now = time.time()
+    with proxy_lock:
+        return [p for p in proxies if proxy_cooldowns.get(p, 0.0) <= now]
+
+
+def get_working_proxy() -> Optional[str]:
+    """Pick a usable proxy, falling back to the local connection if needed."""
+    now = time.time()
+    with proxy_lock:
+        available = [p for p in proxies if proxy_cooldowns.get(p, 0.0) <= now]
+        direct_ready = proxy_cooldowns.get(DIRECT_PROXY, 0.0) <= now
+
+    if available:
+        return random.choice(available)
+    if direct_ready:
+        return DIRECT_PROXY
+    return None
 
 
 def increment_stat(name: str, amount: int = 1) -> None:
@@ -197,36 +397,205 @@ def snapshot_stats() -> Dict[str, int]:
 
 
 def log_status(cycle: int) -> None:
+    now = time.time()
     with proxy_lock:
-        remaining_proxies = proxy_count
-    current_stats = snapshot_stats()
+        total = proxy_count
+        cooling = sum(1 for p in proxies if proxy_cooldowns.get(p, 0.0) > now)
+        direct_cooling = proxy_cooldowns.get(DIRECT_PROXY, 0.0) > now
+    s = snapshot_stats()
     print(
-        f"[✓] - Cycle {cycle} status: "
-        f"checked={current_stats['completed']} "
-        f"failed={current_stats['failed']} "
-        f"valid={current_stats['valid']} "
-        f"proxies={remaining_proxies}"
+        f"[✓] - Cycle {cycle} | checked={s['checked']} valid={s['valid']} "
+        f"failed={s['failed']} rate_limited={s['rate_limited']} | "
+        f"proxies={total} cooling={cooling} direct={'cooling' if direct_cooling else 'ready'}"
     )
 
 
-def is_ignorable_proxy_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return any(
-        token in message
-        for token in [
-            "certificate verify failed",
-            "bad request",
-            "connection to discord.com timed out",
-            "tunnel connection failed",
-            "proxyerror",
-            "sockshttpsconnectionpool",
-            "connecttimeouterror",
-            "conncet timeout",
-            "unable to connect to proxy",
-            "ssleoferror",
-        ]
-    )
+# ---------------------------------------------------------------------------
+# Fetching + validating proxies
+# ---------------------------------------------------------------------------
 
+def _validate_single_proxy(proxy_url: str) -> Optional[str]:
+    """A proxy is only kept if it can actually complete a username check.
+
+    Validation uses the real endpoint and requires Discord's JSON body: many
+    free proxies answer with HTTP 200 and their own status page instead of
+    forwarding, so status codes alone are not enough.
+    """
+    validator_session = getattr(thread_local, "validation_session", None)
+    if validator_session is None:
+        validator_session = requests.Session()
+        validator_session.trust_env = False
+        validator_session.verify = False
+        validator_session.headers.update(session.headers)
+        thread_local.validation_session = validator_session
+
+    try:
+        response = validator_session.post(
+            endpoint,
+            json={"username": VALIDATION_USERNAME},
+            proxies=format_proxy(proxy_url),
+            timeout=PROXY_VALIDATION_TIMEOUT,
+        )
+    except requests.exceptions.RequestException:
+        return None
+
+    if response.status_code != 200:
+        return None
+    try:
+        return proxy_url if "taken" in response.json() else None
+    except ValueError:
+        return None
+
+
+def _validate_batch(urls: List[str]) -> List[str]:
+    if not urls:
+        return []
+    working: List[str] = []
+    with ThreadPoolExecutor(max_workers=PROXY_VALIDATION_WORKERS) as executor:
+        for result in executor.map(_validate_single_proxy, urls):
+            if result is not None:
+                working.append(result)
+    print(f"[✓] - Validated {len(working)}/{len(urls)} working proxies")
+    return working
+
+
+def _fetch_candidates(api_url: str) -> List[Dict]:
+    try:
+        response = requests.get(api_url, timeout=PROXY_FETCH_TIMEOUT)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"[x] - Failed to fetch {api_url}: {e}")
+        return []
+
+    candidates = parse_proxies(response.text)
+    print(f"[✓] - Fetched {len(candidates)} candidates from {api_url}")
+    return candidates
+
+
+def _gather_candidates() -> List[Dict]:
+    """Fetch every source in parallel, quality-gate, dedupe and rank."""
+    candidates: List[Dict] = []
+    with ThreadPoolExecutor(max_workers=max(1, len(proxy_api_urls))) as executor:
+        for batch in executor.map(_fetch_candidates, proxy_api_urls):
+            candidates.extend(batch)
+
+    candidates = _quality_gate(candidates)
+
+    seen = set()
+    unique: List[Dict] = []
+    for candidate in candidates:
+        url = candidate["url"]
+        if url not in seen:
+            seen.add(url)
+            unique.append(candidate)
+
+    return unique
+
+
+def proxy_refresher(stop_event: threading.Event) -> None:
+    """Continuously find and validate working proxies in the background."""
+    while not stop_event.is_set():
+        started_at = time.time()
+        try:
+            candidates = _gather_candidates()
+            with proxy_lock:
+                known = set(proxies)
+            fresh = [c for c in candidates if c["url"] not in known]
+            if len(fresh) > PROXY_VALIDATION_LIMIT:
+                fresh = fresh[:PROXY_VALIDATION_LIMIT]
+
+            for i in range(0, len(fresh), PROXY_VALIDATION_CHUNK):
+                if stop_event.is_set():
+                    return
+                valid = _validate_batch([c["url"] for c in fresh[i:i + PROXY_VALIDATION_CHUNK]])
+                if valid:
+                    add_proxies(valid)
+        except Exception as exc:  # never let the refresher die
+            print(f"[x] - Proxy refresh error: {exc}")
+
+        elapsed = time.time() - started_at
+        stop_event.wait(max(1, PROXY_REFRESH_INTERVAL - elapsed))
+
+
+# ---------------------------------------------------------------------------
+# Discord checks
+# ---------------------------------------------------------------------------
+
+def _retry_after_seconds(response) -> float:
+    try:
+        value = response.json().get("retry_after", 0)
+        return float(value) if value else 0.0
+    except Exception:
+        return 0.0
+
+
+def checkUsername(username: str, stop_event: Optional[threading.Event] = None) -> bool:
+    payload = {"username": username}
+
+    for _ in range(MAX_ATTEMPTS):
+        if stop_event is not None and stop_event.is_set():
+            return False
+
+        proxy_url = get_working_proxy()
+        if proxy_url is None:
+            return False
+
+        try:
+            started_at = time.time()
+            response = session.post(
+                endpoint,
+                json=payload,
+                proxies=format_proxy(proxy_url),
+                timeout=REQUEST_TIMEOUT,
+            )
+            response_time = time.time() - started_at
+        except requests.exceptions.Timeout:
+            remove_proxy(proxy_url, reason="timeout")
+            increment_stat("failed")
+            continue
+        except requests.exceptions.RequestException as exc:
+            if show_proxy_logs:
+                print(f"[x] - Request error via {proxy_url}: {exc}")
+            remove_proxy(proxy_url)
+            increment_stat("failed")
+            continue
+
+        if response_time > MAX_PROXY_RESPONSE_TIME:
+            remove_proxy(proxy_url, reason="timeout")
+            increment_stat("failed")
+            continue
+
+        if response.status_code == 200:
+            try:
+                taken = response.json().get("taken", False)
+            except ValueError:
+                increment_stat("failed")
+                continue
+            increment_stat("checked")
+            if not taken:
+                print(f"[BINGOOO] - VALID USERNAME FOUND: {username}")
+                increment_stat("valid")
+                return True
+            return False
+
+        if response.status_code == 429:
+            retry_after = _retry_after_seconds(response) or DEFAULT_BACKOFF_SECONDS
+            if show_proxy_logs:
+                print(f"[x] - Rate limited (429) via {proxy_url}; cooling down {retry_after:.0f}s")
+            mark_proxy_cooldown(proxy_url, retry_after)
+            continue
+
+        if show_proxy_logs:
+            print(f"[x] - Unexpected {response.status_code} via {proxy_url}: {response.text[:80]}")
+        remove_proxy(proxy_url)
+        increment_stat("failed")
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
 
 def appendToFile(username: str) -> None:
     with open(result_file, "a", encoding="utf-8") as f:
@@ -245,9 +614,9 @@ def send_discord_webhook(username: str) -> None:
             if show_proxy_logs:
                 print(f"[✓] - Sent webhook notification for {username}")
         else:
-            print(f"[X] - Webhook send failed ({response.status_code}): {response.text}")
+            print(f"[x] - Webhook send failed ({response.status_code}): {response.text}")
     except requests.exceptions.RequestException as exc:
-        print(f"[X] - Discord webhook request failed: {exc}")
+        print(f"[x] - Discord webhook request failed: {exc}")
 
 
 def change_discord_username(username: str) -> None:
@@ -257,7 +626,7 @@ def change_discord_username(username: str) -> None:
     """
     if not discord_auth_token:
         if show_proxy_logs:
-            print("[X] - No discord_auth_token provided; skipping username change.")
+            print("[x] - No discord_auth_token provided; skipping username change.")
         return
 
     url = "https://discord.com/api/v9/users/@me"
@@ -268,191 +637,49 @@ def change_discord_username(username: str) -> None:
     try:
         resp = session.patch(url, json=payload, headers=headers, timeout=10)
     except requests.exceptions.RequestException as exc:
-        print(f"[X] - Failed to change Discord username: {exc}")
+        print(f"[x] - Failed to change Discord username: {exc}")
         return
 
     if resp.status_code in (200, 204):
         print(f"[✓] - Discord account username changed to: {username}")
     elif resp.status_code == 401:
-        print("[X] - Unauthorized: invalid discord_auth_token provided.")
+        print("[x] - Unauthorized: invalid discord_auth_token provided.")
     else:
         try:
             error_text = resp.json()
         except Exception:
             error_text = resp.text
-        print(f"[X] - Failed to change username ({resp.status_code}): {error_text}")
+        print(f"[x] - Failed to change username ({resp.status_code}): {error_text}")
 
 
 def pickRandomUsername() -> str:
-    username = ""
-
-    for _ in range(username_length):
-        username += random.choice(characters)
-
-    return username
-
-
-def checkUsername(username: str, stop_event: Optional[threading.Event] = None) -> bool:
-    payload = {"username": username}
-    max_retries = 3
-
-    for attempt in range(max_retries):
-        if stop_event is not None and stop_event.is_set():
-            return False
-
-        if attempt == 0:
-            proxy_url = getattr(thread_local, 'proxy', None)
-            with proxy_lock:
-                if not proxy_url or proxy_url not in proxies:
-                    proxy_url = get_random_proxy()
-                    thread_local.proxy = proxy_url
-        else:
-            proxy_url = get_random_proxy()
-
-        if proxy_url is None:
-            print("[X] - No proxies available for checking username.")
-            refresh_proxies()
-            return False
-
-        proxy = format_proxy(proxy_url)
-        increment_stat("started")
-
-        try:
-            start_time = time.time()
-            response = session.post(endpoint, json=payload, proxies=proxy, timeout=request_timeout_seconds)
-            response_time = time.time() - start_time
-            
-            # Track and check response time
-            with proxy_lock:
-                proxy_response_times[proxy_url] = response_time
-            
-            # Remove proxy if response time exceeds threshold
-            if response_time > max_proxy_response_time:
-                if show_proxy_logs:
-                    print(f"[X] - Slow proxy detected ({response_time:.2f}s > {max_proxy_response_time}s): {proxy_url}")
-                remove_proxy(proxy_url, reason="timeout")
-                continue  # retry with another proxy
-                
-        except requests.exceptions.Timeout:
-            if show_proxy_logs:
-                print(f"[X] - Timeout via proxy {proxy_url} - removing slow proxy")
-            remove_proxy(proxy_url, reason="timeout")
-            increment_stat("failed")
-            continue  # retry with another proxy
-        except requests.exceptions.SSLError as ssl_exc:
-            if show_proxy_logs and not is_ignorable_proxy_error(ssl_exc):
-                print(f"[X] - SSL error via proxy {proxy_url}: {ssl_exc}")
-            remove_proxy(proxy_url)
-            increment_stat("failed")
-            continue  # retry with another proxy
-        except requests.exceptions.RequestException as exc:
-            if show_proxy_logs and not is_ignorable_proxy_error(exc):
-                print(f"[X] - Request error via proxy {proxy_url}: {exc}")
-            remove_proxy(proxy_url)
-            increment_stat("failed")
-            continue  # retry with another proxy
-
-        if response.status_code == 200:
-            try:
-                taken = response.json().get("taken", False)
-                valid = not taken
-            except ValueError:
-                if show_proxy_logs:
-                    print(f"[X] - Invalid JSON response")
-                continue  # retry
-            if valid:
-                print(f"[BINGOOO] - VALID USERNAME FOUND: {username}")
-                increment_stat("valid")
-            elif show_proxy_logs:
-                print(f"[✓] - {username} -> taken={taken} ({response_time:.2f}s) via {proxy_url}")
-            increment_stat("completed")
-            time.sleep(rate_limit_seconds)  # Add delay after successful request
-            return valid
-
-        if response.status_code == 429:
-            if show_proxy_logs:
-                print(f"[X] - Rate limited (429) via {proxy_url}; switching proxy.")
-            remove_proxy_now = False
-            with proxy_lock:
-                proxy_failures[proxy_url] = proxy_failures.get(proxy_url, 0) + 1
-                if proxy_failures[proxy_url] >= proxy_fail_limit:
-                    remove_proxy_now = True
-            if remove_proxy_now:
-                remove_proxy(proxy_url)
-            # switch proxy for this thread
-            thread_local.proxy = get_random_proxy()
-            if thread_local.proxy is None:
-                if show_proxy_logs:
-                    print(f"[X] - No proxies available after rate limit on {proxy_url}")
-                refresh_proxies()
-                return False
-            if show_proxy_logs:
-                print(f"[✓] - Switched to proxy: {thread_local.proxy}")
-            time.sleep(rate_limit_backoff)  # Wait longer after rate limit
-            return False  # don't retry username, just switch proxy
-
-        if show_proxy_logs:
-            print(f"[X] - Error: {response.status_code} - {response.text} via {proxy_url}")
-        increment_stat("failed")
-        time.sleep(rate_limit_seconds)  # Add delay after other errors
-        continue  # retry with another proxy
-
-    # if all attempts failed, return False
-    return False
+    """Generate a Discord-valid random username of the configured length."""
+    length = max(2, min(int(username_length), 32))
+    while True:
+        chars = [random.choice(SAFE_FIRST_CHARS)]
+        chars.extend(random.choice(characters) for _ in range(length - 1))
+        username = "".join(chars)
+        if ".." not in username and not username.endswith("."):
+            return username
 
 
-def wait_for_proxy_pool(stop_event: threading.Event) -> bool:
-    thread_name = threading.current_thread().name
+# ---------------------------------------------------------------------------
+# Workers
+# ---------------------------------------------------------------------------
 
+def worker(stop_event: threading.Event) -> None:
     while not stop_event.is_set():
-        with proxy_lock:
-            if proxies:
-                return True
-
-        print(f"[X] - {thread_name}: No proxies available, refetching...")
-        if refresh_proxies():
-            return True
-
-        stop_event.wait(proxy_empty_retry_seconds)
-
-    return False
-
-
-def worker(stop_event: threading.Event):
-    thread_name = threading.current_thread().name
-    if not wait_for_proxy_pool(stop_event):
-        return
-
-    thread_local.proxy = get_random_proxy()
-    if thread_local.proxy is None:
-        print(f"[X] - {thread_name}: No proxies available, stopping.")
-        return
-    if show_proxy_logs:
-        print(f"[✓] - {thread_name} started with proxy: {thread_local.proxy}")
-    while not stop_event.is_set():
-        with proxy_lock:
-            if not proxies:
-                print(f"[X] - {thread_name}: No proxies remaining, refetching.")
-
-        if not wait_for_proxy_pool(stop_event):
-            break
-
-        if thread_local.proxy is None or thread_local.proxy not in proxies:
-            thread_local.proxy = get_random_proxy()
-            if thread_local.proxy is None:
-                if not wait_for_proxy_pool(stop_event):
-                    break
-                thread_local.proxy = get_random_proxy()
-                if thread_local.proxy is None:
-                    break
+        if get_working_proxy() is None:
+            stop_event.wait(EMPTY_RETRY_SECONDS)
+            continue
 
         username = pickRandomUsername()
         if checkUsername(username, stop_event):
             print(f"[BINGOOO] - Valid username found: {username}")
             appendToFile(username)
             send_discord_webhook(username)
-            # If the found username is exactly 3 letters, attempt to change the authenticated
-            # Discord account username to it (requires `discord_auth_token` in config).
+            # If the found username is exactly 3 letters, attempt to change the
+            # authenticated Discord account username to it.
             try:
                 if len(username) == 3:
                     change_discord_username(username)
@@ -469,55 +696,35 @@ def start_workers(stop_event: threading.Event) -> List[threading.Thread]:
         threads.append(t)
         t.start()
 
-    print(f"[✓] - Launched {len(threads)} worker threads.")
+    print(f"[✓] - Launched {len(threads)} workers.")
     return threads
 
 
-def run_threads_once() -> None:
+def run() -> None:
     stop_event = threading.Event()
+
+    print(f"[✓] - Sources: {len(proxy_api_urls)} | Workers: {threads_number} | Username length: {username_length}")
+    refresher = threading.Thread(target=proxy_refresher, args=(stop_event,), name="ProxyRefresher", daemon=True)
+    refresher.start()
+
     threads = start_workers(stop_event)
 
-    for t in threads:
-        t.join()
-
-
-def run_threads_with_restarts() -> None:
+    last_status = time.time()
     cycle = 1
-
-    while True:
-        print(f"[✓] - Starting worker cycle {cycle} with {threads_number} threads.")
-        refresh_proxies(force=True)
-        stop_event = threading.Event()
-        threads = start_workers(stop_event)
-
-        try:
-            cycle_started_at = time.time()
-            while not stop_event.is_set():
-                remaining_seconds = thread_restart_interval_seconds - (time.time() - cycle_started_at)
-                if remaining_seconds <= 0:
-                    break
-                wait_seconds = min(max(1, status_interval_seconds), remaining_seconds)
-                stop_event.wait(wait_seconds)
-                if not stop_event.is_set() and wait_seconds > 0:
-                    log_status(cycle)
-        except KeyboardInterrupt:
-            stop_event.set()
-            raise
-
-        print(f"[✓] - Restarting workers and refreshing proxies after {thread_restart_interval_seconds}s.")
+    try:
+        while not stop_event.is_set():
+            stop_event.wait(1)
+            now = time.time()
+            if now - last_status >= STATUS_INTERVAL:
+                log_status(cycle)
+                cycle += 1
+                last_status = now
+    except KeyboardInterrupt:
         stop_event.set()
         for t in threads:
             t.join()
-
-        cycle += 1
+        print("\n[✓] - Stopped by user.")
 
 
 if __name__ == "__main__":
-    try:
-        if thread_restart_interval_seconds and thread_restart_interval_seconds > 0:
-            run_threads_with_restarts()
-        else:
-            refresh_proxies(force=True)
-            run_threads_once()
-    except KeyboardInterrupt:
-        print("\n[✓] - Stopped by user.")
+    run()

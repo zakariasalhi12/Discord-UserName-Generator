@@ -1,7 +1,8 @@
 # Discord Username Generator
 
-
-This script generates random Discord usernames and checks their availability using the Discord API. It uses a list of proxies to avoid rate limiting.
+Generates random Discord usernames and checks their availability using the Discord API.
+It discovers working proxies in the background and rotates through them, so it keeps
+making progress even though free proxies are unreliable.
 
 ![Discord Username Generator](assets/image.png)
 
@@ -16,67 +17,72 @@ This script generates random Discord usernames and checks their availability usi
    ```bash
    pip install requests
    ```
-2. The script automatically fetches proxies from the [ProxyScrape API](https://api.proxyscrape.com/), so no manual proxy setup is required.
+2. No manual proxy setup is required — the script pulls proxies from several free
+   sources automatically.
 
 ## Configuration
 
-All settings are stored in `config.json`. Edit this file to customize the script behavior:
+`config.json` is intentionally small. Everything else is tuned internally:
 
 ```json
 {
-  "endpoint": "https://discord.com/api/v9/unique-username/username-attempt-unauthed",
-  "proxy_api_url": "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=619",
+  "threads_number": 16,
   "username_length": 4,
-  "rate_limit_seconds": 0,
-  "rate_limit_backoff": 5,
-  "max_proxy_response_time": 9,
-  "proxy_fail_limit": 2,
-  "threads_number": 3,
-  "proxy_refresh_interval_seconds": 60,
-  "thread_restart_interval_seconds": 60,
-  "proxy_empty_retry_seconds": 5,
-  "request_timeout_seconds": 10,
-  "status_interval_seconds": 10,
-  "show_proxy_logs": false,
+  "proxy_api_urls": [
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=http%2Chttps",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://api.openproxylist.xyz/http.txt",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text"
+  ],
+  "discord_auth_token": "",
+  "discord_webhook_url": "",
   "result_file": "result.txt",
-  "discord_webhook_url": ""
+  "show_proxy_logs": false
 }
 ```
 
 **Configuration Options:**
-- `endpoint` - Discord API endpoint URL
-- `proxy_api_url` - ProxyScrape API URL for fetching proxies
-- `username_length` - Length of generated usernames
-- `rate_limit_seconds` - Delay between normal requests (0 = no delay)
-- `rate_limit_backoff` - Delay after 429 rate limit response
-- `max_proxy_response_time` - Maximum proxy response time in seconds
-- `proxy_fail_limit` - Number of failures before removing a proxy
 - `threads_number` - Number of worker threads
-- `proxy_refresh_interval_seconds` - Minimum seconds between automatic proxy refreshes
-- `thread_restart_interval_seconds` - Seconds before stopping workers, refetching proxies, and starting a fresh worker batch (`0` disables scheduled restarts)
-- `proxy_empty_retry_seconds` - Seconds to wait before retrying proxy fetches when the list is empty
-- `request_timeout_seconds` - Maximum seconds to wait for each Discord check request
-- `status_interval_seconds` - Seconds between progress status lines
-- `show_proxy_logs` - Set to `true` for detailed proxy logs, `false` for clean output
+- `username_length` - Length of generated usernames
+- `proxy_api_urls` - Free proxy sources, tried in order. Plain-text lists (`ip:port`) and JSON APIs are both supported
+- `discord_auth_token` - Optional user token; when set, a found 3-letter username is applied to your account
+- `discord_webhook_url` - Optional Discord webhook for notifications
 - `result_file` - Output file for valid usernames
+- `show_proxy_logs` - Set to `true` for detailed proxy logs
+
+## How it works
+
+1. A background refresher fetches every proxy source in parallel, dedupes and
+   quality-ranks the candidates (Geonode exposes up-time/latency metadata).
+2. Candidates are validated against the **real Discord endpoint**. A proxy is only
+   kept if Discord returns its JSON body — many free proxies answer `200` with
+   their own status page instead of forwarding, which is why status codes alone
+   are not trusted.
+3. Workers rotate through the validated pool. When a proxy is rate-limited (429)
+   it is parked for the `retry_after` window instead of being deleted, so the
+   pool never drains. The local connection is used as a fallback when no proxy
+   is usable.
 
 ## Running the Script
-
-Run the script with:
 
 ```bash
 python generator.py
 ```
 
-The script will start 3 threads, each checking random usernames using random proxies. Valid usernames will be printed and saved to `result.txt`.
+Valid usernames are printed and saved to `result.txt`.
 
 ## Output
 
-- **Always visible**: Valid usernames are printed and saved to `result.txt` (e.g., `✅ VALID USERNAME FOUND: abc`)
-- **With `show_proxy_logs = True`**: Detailed proxy information including response times, errors, rate limits, and slow proxy removals
-- **With `show_proxy_logs = False`** (default): Only valid usernames are displayed for a clean output
+- **Always visible**: valid usernames (`[BINGOOO] - VALID USERNAME FOUND: ...`)
+- **Periodic status**: `checked`, `valid`, `failed`, `rate_limited` and the proxy pool size
+- **With `show_proxy_logs = true`**: detailed proxy errors and cooldowns
 
 ## Notes
 
-- The script handles proxy failures automatically by removing bad proxies after a few failures.
+- Free proxies are unreliable: only a small fraction can reach Discord, and each
+  usable IP allows roughly 15-20 requests before a long cooldown. The background
+  refresher keeps looking for new ones, so the tool improves over time rather
+  than stalling with an empty proxy list.
 - Interrupt with Ctrl+C to stop.
