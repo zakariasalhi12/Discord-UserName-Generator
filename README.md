@@ -1,32 +1,58 @@
 # Discord Username Generator
 
-Generates random Discord usernames and checks their availability using the Discord API.
+Generates random Discord usernames and checks their availability against the Discord API.
 It discovers working proxies in the background and rotates through them, so it keeps
 making progress even though free proxies are unreliable.
 
 ![Discord Username Generator](assets/image.png)
 
+## Features
+
+- Random username generation with a configurable length
+- Free proxy discovery from multiple sources, validated against the real Discord endpoint
+- Background proxy refresher with cooldown-based rotation, so the pool never empties
+- Local-connection fallback when no proxy is usable
+- Discord webhook notifications when a valid username is found
+- Optional automatic username change when a 3-letter name is found
+- Small configuration file with sensible built-in defaults
+- Runs in the foreground or detached in the background
+
 ## Requirements
 
-- Python 3.x
-- `requests` library (install with `pip install requests`)
+- Python 3.8+
+- [`requests`](https://pypi.org/project/requests/) library
 
-## Setup
+Install dependencies:
 
-1. Install Python dependencies:
-   ```bash
-   pip install requests
-   ```
-2. No manual proxy setup is required — the script pulls proxies from several free
-   sources automatically.
+```bash
+pip install requests
+```
+
+## Quick start
+
+```bash
+python generator.py
+```
+
+To run it detached in the background and follow the logs:
+
+```bash
+./run_background.sh
+tail -f app.log
+```
+
+The helper refuses to start a second instance while one is already running, and stores
+the process id in `app.pid`.
 
 ## Configuration
 
-`config.json` is intentionally small. Everything else is tuned internally:
+All settings live in `config.json`. The file is **optional** — if it is missing, the
+script uses built-in defaults. Create it next to `generator.py` with the content below
+(this matches the shipped configuration):
 
 ```json
 {
-  "threads_number": 16,
+  "threads_number": 106,
   "username_length": 4,
   "proxy_api_urls": [
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
@@ -43,14 +69,19 @@ making progress even though free proxies are unreliable.
 }
 ```
 
+> `config.json` is git-ignored so your token and webhook URL stay private.
+
 **Configuration Options:**
-- `threads_number` - Number of worker threads
-- `username_length` - Length of generated usernames
-- `proxy_api_urls` - Free proxy sources, tried in order. Plain-text lists (`ip:port`) and JSON APIs are both supported
-- `discord_auth_token` - Optional user token; when set, a found 3-letter username is applied to your account
-- `discord_webhook_url` - Optional Discord webhook for notifications
-- `result_file` - Output file for valid usernames
-- `show_proxy_logs` - Set to `true` for detailed proxy logs
+
+| Option | Description |
+| --- | --- |
+| `threads_number` | Number of worker threads |
+| `username_length` | Length of generated usernames (clamped to 2-32) |
+| `proxy_api_urls` | Free proxy sources, tried in order. Plain-text lists (`ip:port`) and JSON APIs are both supported |
+| `discord_auth_token` | Optional user token; when set, a found 3-letter username is applied to your account |
+| `discord_webhook_url` | Optional Discord webhook for notifications |
+| `result_file` | Output file for valid usernames |
+| `show_proxy_logs` | Set to `true` for detailed proxy errors and cooldowns |
 
 ## How it works
 
@@ -65,19 +96,13 @@ making progress even though free proxies are unreliable.
    pool never drains. The local connection is used as a fallback when no proxy
    is usable.
 
-## Running the Script
-
-```bash
-python generator.py
-```
-
-Valid usernames are printed and saved to `result.txt`.
-
 ## Output
 
 - **Always visible**: valid usernames (`[BINGOOO] - VALID USERNAME FOUND: ...`)
 - **Periodic status**: `checked`, `valid`, `failed`, `rate_limited` and the proxy pool size
 - **With `show_proxy_logs = true`**: detailed proxy errors and cooldowns
+
+Valid usernames are also appended to `result.txt`.
 
 ## Notes
 
@@ -85,4 +110,21 @@ Valid usernames are printed and saved to `result.txt`.
   usable IP allows roughly 15-20 requests before a long cooldown. The background
   refresher keeps looking for new ones, so the tool improves over time rather
   than stalling with an empty proxy list.
+- Because throughput is limited by the number of usable IPs, a very high
+  `threads_number` does not make the tool faster — it mostly produces `429`s.
+  Start low (16-32) and increase only if your proxy pool is large.
 - Interrupt with Ctrl+C to stop.
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+| --- | --- |
+| `checked=0` right after start | Normal for the first minute; the refresher is still validating candidates. It rises as working proxies are found. |
+| `proxies=0` | No proxy validated in the current refresh round. The refresher keeps trying; the local connection is used meanwhile. |
+| Nothing is ever found | Free proxies are the bottleneck. Add your own proxy sources to `proxy_api_urls` or run from an IP that is not rate-limited. |
+
+## Disclaimer
+
+This tool is intended for checking the availability of usernames you may legitimately
+claim. Automated account changes, bulk username squatting, or any activity that violates
+Discord's [Terms of Service](https://discord.com/terms) is your responsibility.
