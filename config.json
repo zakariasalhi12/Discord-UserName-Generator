@@ -1,0 +1,17 @@
+{
+  "threads_number": 50,
+  "username_length": 4,
+  "usernames_file": "",
+  "proxy_list_file": "",
+  "proxy_api_urls": [
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=http%2Chttps",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://api.openproxylist.xyz/http.txt",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text"
+  ],
+  "discord_auth_token": "",
+  "discord_webhook_url": "",
+  "result_file": "result.txt"
+}
